@@ -208,6 +208,60 @@ POLY_MAX_ORDERS_PER_CITY_DATE=2
 - 每轮最多投入 `5U`。
 - 同城市同日期最多持有 `2` 单，避免相关性过高。
 
+## 分档仓位逻辑
+
+脚本不是固定每个信号都下同样金额，而是会根据机会质量自动调整仓位乘数。
+
+强信号会提高仓位：
+
+```env
+POLY_STRONG_SIGNAL_EDGE=0.24
+POLY_STRONG_SIGNAL_EV=0.35
+POLY_STRONG_SIGNAL_CONFIDENCE=0.72
+POLY_MAX_SIGNAL_MULTIPLIER=1.80
+```
+
+含义：
+
+- 当 edge、EV、模型确定性都达到强信号门槛时，仓位乘数最高可以放大到 `1.80`。
+- 这用于捕捉收益率更高的机会。
+
+弱信号会降低仓位：
+
+```env
+POLY_WEAK_SIGNAL_MULTIPLIER=0.50
+```
+
+含义：
+
+- 如果信号刚刚过线但不够强，仓位会自动减半。
+
+exact 市场会额外降仓：
+
+```env
+POLY_EXACT_SIGNAL_MULTIPLIER=0.80
+POLY_YES_EXACT_SIGNAL_MULTIPLIER=0.45
+```
+
+含义：
+
+- exact 温度市场更难命中，所以默认会降低仓位。
+- YES exact 风险更高，因此仓位折扣更大。
+
+历史与预报分歧过大时会减仓或过滤：
+
+```env
+POLY_HISTORY_GAP_REDUCE=0.18
+POLY_HISTORY_GAP_HARD_CAP=0.25
+```
+
+含义：
+
+- 如果历史温度概率和当前预报概率差距较大，仓位会降低。
+- 如果分歧超过硬上限，信号会被过滤。
+
+注意：这里的“分档仓位”是指下单前根据机会质量决定轻仓或重仓，不是持仓后持续补仓的马丁格尔式加仓。
+
 ## 止盈与止损
 
 ```env
