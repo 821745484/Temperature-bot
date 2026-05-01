@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+
+csv/
+*.csv
+*.log
+*order_state*.json
+*signals*.csv
+*_archived.*
+*diagnosis*.md
+
+polymarket_temperature_quant - 副本.py
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
