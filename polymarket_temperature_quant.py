@@ -68,9 +68,50 @@ CLOB_URL = os.getenv("POLY_CLOB_URL", "https://clob.polymarket.com")
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+AVIATION_WEATHER_METAR_URL = "https://aviationweather.gov/api/data/metar"
 LOG_PATH = Path(os.getenv("POLY_LOG_CSV", str(BASE_DIR / "csv" / "polymarket_temperature_signals.csv")))
 ORDER_STATE_PATH = Path(os.getenv("POLY_ORDER_STATE_JSON", str(BASE_DIR / "csv" / "polymarket_temperature_order_state.json")))
+SNAPSHOT_DIR = Path(os.getenv("POLY_SNAPSHOT_DIR", str(BASE_DIR / "csv" / "snapshots")))
+STATION_CALIBRATION_PATH = Path(os.getenv("POLY_STATION_CALIBRATION_JSON", str(BASE_DIR / "csv" / "station_calibration.json")))
 VERBOSE = os.getenv("POLY_VERBOSE", "false").lower() == "true"
+
+STATION_COORDS: dict[str, dict[str, float]] = {
+    "KATL": {"latitude": 33.6407, "longitude": -84.4277},
+    "KDEN": {"latitude": 39.8561, "longitude": -104.6737},
+    "KDAL": {"latitude": 32.8473, "longitude": -96.8511},
+    "KEWR": {"latitude": 40.6895, "longitude": -74.1745},
+    "KIAH": {"latitude": 29.9902, "longitude": -95.3368},
+    "KLAS": {"latitude": 36.0840, "longitude": -115.1537},
+    "KLAX": {"latitude": 33.9425, "longitude": -118.4081},
+    "KLGA": {"latitude": 40.7769, "longitude": -73.8740},
+    "KMIA": {"latitude": 25.7959, "longitude": -80.2870},
+    "KORD": {"latitude": 41.9742, "longitude": -87.9073},
+    "KPHX": {"latitude": 33.4373, "longitude": -112.0078},
+    "KSFO": {"latitude": 37.6213, "longitude": -122.3790},
+    "KSEA": {"latitude": 47.4502, "longitude": -122.3088},
+    "EGLL": {"latitude": 51.4775, "longitude": -0.4614},
+    "EGLC": {"latitude": 51.5053, "longitude": 0.0553},
+    "LEMD": {"latitude": 40.4719, "longitude": -3.5626},
+    "LFPG": {"latitude": 49.0097, "longitude": 2.5479},
+    "EDDB": {"latitude": 52.3667, "longitude": 13.5033},
+    "EHAM": {"latitude": 52.3086, "longitude": 4.7639},
+    "LIRF": {"latitude": 41.8003, "longitude": 12.2389},
+    "LSZH": {"latitude": 47.4647, "longitude": 8.5492},
+    "RJTT": {"latitude": 35.5494, "longitude": 139.7798},
+    "RKSI": {"latitude": 37.4602, "longitude": 126.4407},
+    "RKPK": {"latitude": 35.1795, "longitude": 128.9382},
+    "VHHH": {"latitude": 22.3080, "longitude": 113.9185},
+    "ZSPD": {"latitude": 31.1443, "longitude": 121.8083},
+    "ZBAA": {"latitude": 40.0799, "longitude": 116.5844},
+    "WSSS": {"latitude": 1.3644, "longitude": 103.9915},
+    "YSSY": {"latitude": -33.9399, "longitude": 151.1753},
+    "OMDB": {"latitude": 25.2532, "longitude": 55.3657},
+    "VTBS": {"latitude": 13.6811, "longitude": 100.7470},
+    "RCTP": {"latitude": 25.0777, "longitude": 121.2328},
+    "RPLL": {"latitude": 14.5086, "longitude": 121.0194},
+    "OPKC": {"latitude": 24.9065, "longitude": 67.1608},
+    "WIHH": {"latitude": -6.2666, "longitude": 106.8911},
+}
 
 
 @dataclass
@@ -107,9 +148,20 @@ class Config:
     yes_intraday_confirm_above_price: Decimal = Decimal(os.getenv("POLY_YES_INTRADAY_CONFIRM_ABOVE_PRICE", "0.10"))
     yes_intraday_confirm_distance: Decimal = Decimal(os.getenv("POLY_YES_INTRADAY_CONFIRM_DISTANCE", "0.80"))
     yes_intraday_max_days_ahead: int = int(os.getenv("POLY_YES_INTRADAY_MAX_DAYS_AHEAD", "1"))
+    metar_enabled: bool = os.getenv("POLY_METAR_ENABLED", "true").lower() == "true"
+    no_metar_block_distance: Decimal = Decimal(os.getenv("POLY_NO_METAR_BLOCK_DISTANCE", "1.00"))
+    no_metar_risk_distance: Decimal = Decimal(os.getenv("POLY_NO_METAR_RISK_DISTANCE", "1.50"))
+    calibration_enabled: bool = os.getenv("POLY_STATION_CALIBRATION_ENABLED", "true").lower() == "true"
+    calibration_min_samples: int = int(os.getenv("POLY_STATION_CALIBRATION_MIN_SAMPLES", "8"))
+    calibration_max_abs_shift: Decimal = Decimal(os.getenv("POLY_STATION_CALIBRATION_MAX_ABS_SHIFT", "0.06"))
+    snapshot_enabled: bool = os.getenv("POLY_SNAPSHOT_ENABLED", "true").lower() == "true"
     no_min_edge: Decimal = Decimal(os.getenv("POLY_NO_MIN_EDGE", os.getenv("POLY_MIN_EDGE", "0.08")))
     no_min_ev: Decimal = Decimal(os.getenv("POLY_NO_MIN_EV", os.getenv("POLY_MIN_EV", "0.03")))
     no_min_score: Decimal = Decimal(os.getenv("POLY_NO_MIN_SCORE", os.getenv("POLY_MIN_SCORE", "0.04")))
+    no_max_days_ahead: int = int(os.getenv("POLY_NO_MAX_DAYS_AHEAD", "0"))
+    no_size_multiplier: Decimal = Decimal(os.getenv("POLY_NO_SIZE_MULTIPLIER", "0.65"))
+    no_exact_min_forecast_distance: Decimal = Decimal(os.getenv("POLY_NO_EXACT_MIN_FORECAST_DISTANCE", "1.00"))
+    no_exact_min_history_no_prob: Decimal = Decimal(os.getenv("POLY_NO_EXACT_MIN_HISTORY_NO_PROB", "0.80"))
     exact_extra_edge: Decimal = Decimal(os.getenv("POLY_EXACT_EXTRA_EDGE", "0.00"))
     max_spread: Decimal = Decimal(os.getenv("POLY_MAX_SPREAD", "0.06"))
     max_price: Decimal = Decimal(os.getenv("POLY_MAX_PRICE", "0.85"))
@@ -188,6 +240,10 @@ class IntradayContext:
     current_c: Optional[Decimal]
     target_peak_c: Optional[Decimal]
     target_low_c: Optional[Decimal]
+    metar_c: Optional[Decimal] = None
+    metar_station: str = ""
+    metar_raw: str = ""
+    metar_time: str = ""
 
 
 @dataclass
@@ -223,6 +279,8 @@ def http_get(url: str, params: dict[str, Any], timeout: int = 30, retries: int =
 GEOCODE_CACHE: dict[str, dict[str, Any]] = {}
 HISTORY_TEMP_CACHE: dict[tuple[str, str, str, int, int], list[Decimal]] = {}
 INTRADAY_CACHE: dict[tuple[str, str], IntradayContext] = {}
+METAR_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+STATION_CALIBRATION_CACHE: Optional[dict[str, Any]] = None
 
 
 def parse_json_list(value: Any) -> list[Any]:
@@ -266,6 +324,134 @@ def market_volume(market: dict[str, Any]) -> Decimal:
         if value > 0:
             return value
     return Decimal("0")
+
+
+def station_code_from_resolution_source(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"/([A-Z0-9]{4})/?(?:[?#].*)?$", text.upper())
+    if not match:
+        return ""
+    code = match.group(1)
+    return code if code in STATION_COORDS else ""
+
+
+def station_geo_from_market(market: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not market:
+        return None
+    code = station_code_from_resolution_source(market.get("resolutionSource"))
+    if not code:
+        return None
+    coords = STATION_COORDS.get(code)
+    if not coords:
+        return None
+    return {
+        "latitude": coords["latitude"],
+        "longitude": coords["longitude"],
+        "source": f"resolution_station:{code}",
+        "station_code": code,
+    }
+
+
+def parse_metar_temp_from_raw(raw: str) -> Optional[Decimal]:
+    match = re.search(r"\b(M?\d{2})/(?:M?\d{2}|//)\b", raw)
+    if not match:
+        return None
+    temp = match.group(1)
+    sign = Decimal("-1") if temp.startswith("M") else Decimal("1")
+    digits = temp[1:] if temp.startswith("M") else temp
+    return sign * Decimal(digits)
+
+
+def fetch_metar_observation(station_code: str, cfg: Config) -> Optional[dict[str, Any]]:
+    if not cfg.metar_enabled or not station_code:
+        return None
+    now = time.time()
+    cached = METAR_CACHE.get(station_code)
+    if cached and now - cached[0] < 300:
+        return cached[1]
+    try:
+        response = requests.get(
+            AVIATION_WEATHER_METAR_URL,
+            params={"ids": station_code, "format": "json"},
+            timeout=15,
+            headers={"User-Agent": "polymarket-temperature-bot/1.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        if VERBOSE:
+            print(f"METAR fetch failed station={station_code} error={exc}", flush=True)
+        METAR_CACHE[station_code] = (now, None)
+        return None
+    if not isinstance(data, list) or not data:
+        METAR_CACHE[station_code] = (now, None)
+        return None
+    item = data[0]
+    raw = str(item.get("rawOb") or item.get("raw_text") or item.get("raw") or "")
+    temp_value = item.get("temp") or item.get("temp_c") or item.get("temperature")
+    temp_c = dec(temp_value) if temp_value not in [None, ""] else parse_metar_temp_from_raw(raw)
+    if temp_c is None:
+        METAR_CACHE[station_code] = (now, None)
+        return None
+    obs = {
+        "station": station_code,
+        "temp_c": temp_c,
+        "raw": raw,
+        "time": str(item.get("obsTime") or item.get("reportTime") or item.get("receiptTime") or ""),
+    }
+    METAR_CACHE[station_code] = (now, obs)
+    return obs
+
+
+def load_station_calibration() -> dict[str, Any]:
+    global STATION_CALIBRATION_CACHE
+    if STATION_CALIBRATION_CACHE is not None:
+        return STATION_CALIBRATION_CACHE
+    if not STATION_CALIBRATION_PATH.exists():
+        STATION_CALIBRATION_CACHE = {}
+        return STATION_CALIBRATION_CACHE
+    try:
+        data = json.loads(STATION_CALIBRATION_PATH.read_text(encoding="utf-8"))
+        STATION_CALIBRATION_CACHE = data if isinstance(data, dict) else {}
+    except Exception:
+        STATION_CALIBRATION_CACHE = {}
+    return STATION_CALIBRATION_CACHE
+
+
+def calibration_entries(station_code: str, comparator: str) -> list[dict[str, Any]]:
+    if not station_code:
+        return []
+    data = load_station_calibration()
+    entries = []
+    for key in [station_code, f"{station_code}:{comparator}"]:
+        value = data.get(key)
+        if isinstance(value, dict):
+            entries.append(value)
+    return entries
+
+
+def apply_station_calibration(prob_yes: Decimal, station_code: str, comparator: str, cfg: Config) -> tuple[Decimal, str]:
+    if not cfg.calibration_enabled:
+        return prob_yes, "calibration disabled"
+    calibrated = prob_yes
+    notes = []
+    for entry in calibration_entries(station_code, comparator):
+        samples = int(dec(entry.get("samples")))
+        if samples < cfg.calibration_min_samples:
+            notes.append(f"skip samples={samples}")
+            continue
+        shrink = dec(entry.get("probability_shrink"))
+        if shrink > 0:
+            calibrated = shrink_probability(calibrated, clamp(shrink, Decimal("0"), Decimal("1")))
+            notes.append(f"shrink={shrink}")
+        shift = dec(entry.get("yes_bias") or entry.get("prob_shift"))
+        if shift:
+            shift = clamp(shift, -cfg.calibration_max_abs_shift, cfg.calibration_max_abs_shift)
+            calibrated = clamp(calibrated + shift, Decimal("0.01"), Decimal("0.99"))
+            notes.append(f"shift={shift}")
+    return calibrated, ",".join(notes) if notes else "neutral"
 
 
 def is_temperature_event(event: dict[str, Any]) -> bool:
@@ -343,6 +529,7 @@ def fetch_temperature_markets(cfg: Config) -> list[dict[str, Any]]:
             merged["eventTitle"] = event.get("title", "")
             merged["eventSlug"] = event.get("slug", "")
             merged["eventEndDate"] = event.get("endDate", "")
+            merged["resolutionSource"] = market.get("resolutionSource") or event.get("resolutionSource", "")
             markets.append(merged)
         if VERBOSE:
             print(f"temperature_markets_collected={len(markets)}", flush=True)
@@ -473,8 +660,12 @@ def geocode_city(city: str) -> Optional[dict[str, Any]]:
     return results[0]
 
 
-def forecast_temperature_c(city: str, temp_kind: str, target_date: str, cfg: Config) -> ForecastPoint:
-    geo = geocode_city(city)
+def market_weather_geo(city: str, market: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    return station_geo_from_market(market) or geocode_city(city)
+
+
+def forecast_temperature_c(city: str, temp_kind: str, target_date: str, cfg: Config, market: Optional[dict[str, Any]] = None) -> ForecastPoint:
+    geo = market_weather_geo(city, market)
     if not geo:
         raise ValueError(f"cannot geocode city={city}")
     params = {
@@ -495,11 +686,12 @@ def forecast_temperature_c(city: str, temp_kind: str, target_date: str, cfg: Con
     return ForecastPoint(date=str(dates[idx]), temp_c=Decimal(str(values[idx])))
 
 
-def intraday_temperature_context(city: str, target_date: str, cfg: Config) -> Optional[IntradayContext]:
-    cache_key = (city.strip().lower(), target_date)
+def intraday_temperature_context(city: str, target_date: str, cfg: Config, market: Optional[dict[str, Any]] = None) -> Optional[IntradayContext]:
+    station_code = station_code_from_resolution_source((market or {}).get("resolutionSource"))
+    cache_key = (city.strip().lower(), target_date, station_code)
     if cache_key in INTRADAY_CACHE:
         return INTRADAY_CACHE[cache_key]
-    geo = geocode_city(city)
+    geo = market_weather_geo(city, market)
     if not geo:
         return None
     data = http_get(
@@ -518,6 +710,10 @@ def intraday_temperature_context(city: str, target_date: str, cfg: Config) -> Op
     )
     current_raw = (data.get("current") or {}).get("temperature_2m")
     current_c = Decimal(str(current_raw)) if current_raw is not None else None
+    metar = fetch_metar_observation(station_code, cfg)
+    metar_c = metar.get("temp_c") if metar else None
+    if metar_c is not None:
+        current_c = metar_c
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
     values = hourly.get("temperature_2m", [])
@@ -530,9 +726,35 @@ def intraday_temperature_context(city: str, target_date: str, cfg: Config) -> Op
         current_c=current_c,
         target_peak_c=max(target_values) if target_values else None,
         target_low_c=min(target_values) if target_values else None,
+        metar_c=metar_c,
+        metar_station=station_code if metar else "",
+        metar_raw=str(metar.get("raw", "")) if metar else "",
+        metar_time=str(metar.get("time", "")) if metar else "",
     )
     INTRADAY_CACHE[cache_key] = ctx
     return ctx
+
+
+def no_metar_risk_reason(parsed: ParsedMarket, ctx: Optional[IntradayContext], cfg: Config) -> Optional[str]:
+    if ctx is None or ctx.metar_c is None:
+        return None
+    current = ctx.metar_c
+    threshold = parsed.threshold_c
+    distance = abs(current - threshold)
+    if parsed.comparator == "exact":
+        if distance <= cfg.no_metar_block_distance:
+            return f"NO blocked by METAR station={ctx.metar_station} current={current} threshold={threshold} distance={distance}"
+        if distance <= cfg.no_metar_risk_distance:
+            return f"NO risky by METAR station={ctx.metar_station} current={current} threshold={threshold} distance={distance}"
+    elif parsed.comparator == "above":
+        if current >= threshold:
+            return f"NO dead/risky by METAR station={ctx.metar_station} current={current} >= threshold={threshold}"
+        if threshold - current <= cfg.no_metar_risk_distance:
+            return f"NO too close by METAR station={ctx.metar_station} current={current} threshold={threshold}"
+    elif parsed.comparator == "below":
+        if current <= threshold and threshold - current <= cfg.no_metar_block_distance:
+            return f"NO below-market close by METAR station={ctx.metar_station} current={current} threshold={threshold}"
+    return None
 
 
 def yes_intraday_confirmed(parsed: ParsedMarket, ctx: Optional[IntradayContext], cfg: Config) -> tuple[bool, str]:
@@ -570,14 +792,16 @@ def historical_temperature_stats(
     threshold_c: Decimal,
     comparator: str,
     cfg: Config,
+    market: Optional[dict[str, Any]] = None,
 ) -> Optional[HistoricalStats]:
     if not cfg.history_enabled:
         return None
-    geo = geocode_city(city)
+    geo = market_weather_geo(city, market)
     if not geo:
         return None
 
-    cache_key = (city.strip().lower(), temp_kind, target_date, cfg.history_lookback_years, cfg.history_window_days)
+    station_code = station_code_from_resolution_source((market or {}).get("resolutionSource"))
+    cache_key = (city.strip().lower(), station_code, temp_kind, target_date, cfg.history_lookback_years, cfg.history_window_days)
     temps = HISTORY_TEMP_CACHE.get(cache_key)
     if temps is None:
         target = datetime.strptime(target_date, "%Y-%m-%d").date()
@@ -805,6 +1029,8 @@ def build_candidate(
     size_multiplier = signal_size_multiplier(prob, edge, ev, comparator, side, history_gap, cfg)
     if side == "YES" and price <= cfg.yes_early_max_price:
         size_multiplier *= cfg.yes_early_size_multiplier
+    if side == "NO":
+        size_multiplier *= cfg.no_size_multiplier
     size_multiplier = clamp(size_multiplier, Decimal("0.20"), Decimal("2.00"))
     max_dollars = (cfg.bankroll * cfg.max_trade_pct).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     order_size = min((base_order_size * size_multiplier).quantize(Decimal("0.01"), rounding=ROUND_DOWN), max_dollars)
@@ -848,14 +1074,18 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         return None
     yes_book = book_side(get_order_book(yes_token), cfg.yes_max_price)
     no_book = book_side(get_order_book(no_token), cfg.no_max_price)
-    forecast = forecast_temperature_c(parsed.city, parsed.temp_kind, parsed.target_date, cfg)
+    forecast = forecast_temperature_c(parsed.city, parsed.temp_kind, parsed.target_date, cfg, market)
     forecast_yes = probability_from_band(forecast.temp_c, parsed.threshold_c, parsed.comparator, cfg.temp_band_c)
     intraday_ctx = None
     intraday_ok = False
     intraday_reason = "intraday disabled"
-    if cfg.yes_intraday_enabled and target_days <= cfg.yes_intraday_max_days_ahead:
+    needs_intraday = (
+        (cfg.yes_intraday_enabled and target_days <= cfg.yes_intraday_max_days_ahead)
+        or (cfg.metar_enabled and target_days <= max(cfg.no_max_days_ahead, cfg.yes_intraday_max_days_ahead))
+    )
+    if needs_intraday:
         try:
-            intraday_ctx = intraday_temperature_context(parsed.city, parsed.target_date, cfg)
+            intraday_ctx = intraday_temperature_context(parsed.city, parsed.target_date, cfg, market)
             intraday_ok, intraday_reason = yes_intraday_confirmed(parsed, intraday_ctx, cfg)
         except Exception as exc:
             intraday_reason = f"YES intraday fetch failed: {exc}"
@@ -868,8 +1098,11 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         parsed.threshold_c,
         parsed.comparator,
         cfg,
+        market,
     )
     raw_yes = blend_probabilities(forecast_yes, history, cfg)
+    station_code = station_code_from_resolution_source(market.get("resolutionSource"))
+    raw_yes, calibration_note = apply_station_calibration(raw_yes, station_code, parsed.comparator, cfg)
     model_yes = shrink_probability(raw_yes, cfg.probability_shrink)
     model_no = Decimal("1") - model_yes
     forecast_no = Decimal("1") - forecast_yes
@@ -958,6 +1191,24 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         if item["side"] == "YES" and parsed.comparator == "above" and history:
             if history.prob_yes < cfg.yes_above_min_history_prob:
                 out.append(f"YES above history_prob {history.prob_yes:.4f} < {cfg.yes_above_min_history_prob}")
+        if item["side"] == "NO":
+            metar_risk = no_metar_risk_reason(parsed, intraday_ctx, cfg)
+            if metar_risk:
+                out.append(metar_risk)
+            if target_days > cfg.no_max_days_ahead:
+                out.append(f"NO days_ahead {target_days} > {cfg.no_max_days_ahead}")
+            if parsed.comparator == "exact":
+                forecast_distance = abs(forecast.temp_c - parsed.threshold_c)
+                if forecast_distance < cfg.no_exact_min_forecast_distance:
+                    out.append(
+                        f"NO exact forecast_distance {forecast_distance:.4f} < {cfg.no_exact_min_forecast_distance}"
+                    )
+                if history:
+                    history_no_prob = Decimal("1") - history.prob_yes
+                    if history_no_prob < cfg.no_exact_min_history_no_prob:
+                        out.append(
+                            f"NO exact history_no_prob {history_no_prob:.4f} < {cfg.no_exact_min_history_no_prob}"
+                        )
         if item["edge"] < item_min_edge:
             out.append(f"{item['side']} edge {item['edge']:.4f} < {item_min_edge}")
         if item["ev"] < item_min_ev:
@@ -1007,6 +1258,7 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         "slug": market.get("slug", ""),
         "question": normalize_degree_text(str(market.get("question", ""))),
         "city": parsed.city,
+        "station_code": station_code,
         "side": side,
         "token_id": token_id,
         "action": "BUY" if not reasons else "MONITOR",
@@ -1032,6 +1284,10 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         "minimum_tick_size": minimum_tick_size,
         "minimum_order_size": minimum_order_size,
         "accepting_orders": accepting_orders,
+        "metar_c": intraday_ctx.metar_c if intraday_ctx else None,
+        "metar_station": intraday_ctx.metar_station if intraday_ctx else "",
+        "metar_time": intraday_ctx.metar_time if intraday_ctx else "",
+        "calibration": calibration_note,
         "reason": "; ".join(reasons) if reasons else (
             f"best_side={side} forecast_prob_yes={forecast_yes:.4f} "
             f"history_prob_yes={(history.prob_yes if history else Decimal('0')):.4f} "
@@ -1039,6 +1295,8 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
             f"net_ev={ev:.4f} size_multiplier={candidate['size_multiplier']:.2f} "
             f"yes_mode={'early_low_price' if side == 'YES' and price <= cfg.yes_early_max_price else ('intraday_confirmed' if side == 'YES' and intraday_ok else 'standard')} "
             f"intraday={intraday_reason} "
+            f"metar={intraday_ctx.metar_c if intraday_ctx else None}@{intraday_ctx.metar_station if intraday_ctx else ''} "
+            f"calibration={calibration_note} "
             f"tick={minimum_tick_size} min_order_size={minimum_order_size} EV/Kelly/certainty/liquidity passed"
         ),
     }
@@ -1050,7 +1308,7 @@ def ensure_log() -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            "ts", "slug", "city", "side", "action", "forecast_date", "target_date", "forecast_c", "threshold_c",
+            "ts", "slug", "city", "station_code", "side", "action", "forecast_date", "target_date", "forecast_c", "threshold_c",
             "comparator", "model_yes_raw", "model_yes", "model_prob_side", "market_price", "spread", "depth",
             "volume", "edge", "gross_ev", "ev", "kelly_fraction", "size_multiplier", "order_size", "score",
             "minimum_tick_size", "minimum_order_size", "accepting_orders", "reason", "question",
@@ -1071,6 +1329,37 @@ def save_order_state(state: dict[str, Any]) -> None:
     ORDER_STATE_PATH.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [json_safe(v) for v in value]
+    return value
+
+
+def save_signal_snapshot(row: dict[str, Any], status: str, extra: Optional[dict[str, Any]] = None) -> str:
+    if not os.getenv("POLY_SNAPSHOT_ENABLED", "true").lower() == "true":
+        return ""
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(row.get("slug", "unknown")))[:140]
+    path = SNAPSHOT_DIR / f"{ts}_{slug}_{status}.json"
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "signal": row,
+        "extra": extra or {},
+    }
+    path.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
 def mark_order_state(state: dict[str, Any], row: dict[str, Any], mode: str, status: str) -> None:
     price = dec(row.get("market_price"))
     order_size = dec(row.get("order_size"))
@@ -1081,6 +1370,7 @@ def mark_order_state(state: dict[str, Any], row: dict[str, Any], mode: str, stat
         "slug": row["slug"],
         "side": row["side"],
         "city": row.get("city", ""),
+        "station_code": row.get("station_code", ""),
         "target_date": row["target_date"],
         "price": str(price),
         "order_size": str(order_size),
@@ -1088,6 +1378,7 @@ def mark_order_state(state: dict[str, Any], row: dict[str, Any], mode: str, stat
         "remaining_shares": str(shares),
         "mode": mode,
         "status": status,
+        "snapshot_path": row.get("snapshot_path", ""),
         "take_profit_reduced": bool(row.get("take_profit_reduced", False)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1171,7 +1462,7 @@ def prepare_live_order(row: dict[str, Any], cfg: Config, target_dollars: Optiona
 def log_signal(row: dict[str, Any]) -> None:
     with LOG_PATH.open("a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            datetime.now(timezone.utc).isoformat(), row["slug"], row["city"], row["side"], row["action"],
+            datetime.now(timezone.utc).isoformat(), row["slug"], row["city"], row.get("station_code", ""), row["side"], row["action"],
             row["forecast_date"], row["target_date"], str(row["forecast_c"]), str(row["threshold_c"]), row["comparator"],
             str(row["model_yes_raw"]), str(row["model_yes"]), str(row["model_prob_side"]), str(row["market_price"]),
             str(row["spread"]), str(row["depth"]), str(row["volume"]), str(row["edge"]), str(row["gross_ev"]), str(row["ev"]),
@@ -1343,6 +1634,8 @@ def maybe_order(row: dict[str, Any], cfg: Config, order_state: dict[str, Any]) -
         return "SKIP_DUPLICATE", Decimal("0")
     if not cfg.auto_order:
         print(f"DRY_RUN {row['side']} price={row['market_price']} size=${row['order_size']} slug={row['slug']}")
+        row = dict(row)
+        row["snapshot_path"] = save_signal_snapshot(row, "DRY_RUN_RECORDED")
         mark_order_state(order_state, row, mode="DRY_RUN", status="RECORDED")
         return "DRY_RUN_RECORDED", dec(row["order_size"])
     if not cfg.private_key:
@@ -1375,6 +1668,11 @@ def maybe_order(row: dict[str, Any], cfg: Config, order_state: dict[str, Any]) -
                             f"available=${balance_dollars} matched=${matched_dollars or Decimal('0')} requested=${requested_dollars or Decimal('0')} resp={retry_resp}",
                             flush=True,
                         )
+                        retry_row["snapshot_path"] = save_signal_snapshot(
+                            retry_row,
+                            "ORDER_SENT_REDUCED",
+                            {"response": retry_resp, "available": balance_dollars, "matched": matched_dollars, "requested": requested_dollars},
+                        )
                         mark_order_state(order_state, retry_row, mode="AUTO_ORDER", status="SENT")
                         return "ORDER_SENT", dec(retry_row["order_size"])
                     except Exception as retry_exc:
@@ -1387,13 +1685,16 @@ def maybe_order(row: dict[str, Any], cfg: Config, order_state: dict[str, Any]) -
                 f"available=${balance_dollars if balance_dollars is not None else 'unknown'} err={exc}",
                 flush=True,
             )
+            save_signal_snapshot(live_row, "ORDER_SKIP_INSUFFICIENT_BALANCE", {"error": str(exc)})
             return "ORDER_SKIP_INSUFFICIENT_BALANCE", Decimal("0")
         print(
             f"ORDER_FAILED kind={err_kind} slug={live_row['slug']} dollars=${live_row['order_size']} err={exc}",
             flush=True,
         )
+        save_signal_snapshot(live_row, f"ORDER_FAILED_{err_kind}", {"error": str(exc)})
         return f"ORDER_FAILED_{err_kind}", Decimal("0")
     print(f"ORDER_SENT side={live_row['side']} price={price} shares={shares} dollars={live_row['order_size']} resp={resp}")
+    live_row["snapshot_path"] = save_signal_snapshot(live_row, "ORDER_SENT", {"response": resp})
     mark_order_state(order_state, live_row, mode="AUTO_ORDER", status="SENT")
     return "ORDER_SENT", dec(live_row["order_size"])
 
@@ -1659,6 +1960,9 @@ def main() -> None:
         f"yes_intraday_confirm_above_price={cfg.yes_intraday_confirm_above_price} "
         f"yes_intraday_confirm_distance={cfg.yes_intraday_confirm_distance} "
         f"NO(edge/ev/score)={cfg.no_min_edge}/{cfg.no_min_ev}/{cfg.no_min_score} "
+        f"no_max_days_ahead={cfg.no_max_days_ahead} no_size_multiplier={cfg.no_size_multiplier} "
+        f"no_exact_min_forecast_distance={cfg.no_exact_min_forecast_distance} "
+        f"no_exact_min_history_no_prob={cfg.no_exact_min_history_no_prob} "
         f"YES(edge/ev/score)={cfg.yes_min_edge}/{cfg.yes_min_ev}/{cfg.yes_min_score}"
     )
     while True:

@@ -27,7 +27,7 @@ Highest temperature in <city> on <date>?
 主要逻辑：
 
 - YES 侧偏向低价高赔率机会。
-- NO 侧允许买入更高价格，但要求更强的确认信号。
+- NO 侧改为保守确认型，只做更低价格、更近日期、更强历史支持的机会。
 - 结合天气预报、历史温度、盘中实况、市场价格、盘口流动性、edge、EV 和仓位风控。
 - 控制同城市同日期的重复下注，减少相关性风险。
 - 支持 DRY_RUN 纸面测试和 LIVE 自动下单。
@@ -156,12 +156,14 @@ POLY_YES_MAX_PRICE=0.18
 POLY_YES_INTRADAY_ENABLED=true
 POLY_YES_INTRADAY_CONFIRM_ABOVE_PRICE=0.10
 POLY_YES_INTRADAY_CONFIRM_DISTANCE=0.80
+POLY_METAR_ENABLED=true
 ```
 
 含义：
 
 - YES 价格高于 `0.10` 时，需要盘中实况或小时级预报确认。
 - 当前温度或小时级峰值需要距离阈值不超过 `0.80°C`。
+- 如果市场能识别出机场站点，脚本会优先尝试 AviationWeather METAR 实况温度。
 - 这样可以保留低价提前埋伏机会，同时减少中价 YES 的错误入场。
 
 ## NO 策略
@@ -169,17 +171,26 @@ POLY_YES_INTRADAY_CONFIRM_DISTANCE=0.80
 NO 主要走确认型逻辑。
 
 ```env
-POLY_NO_MAX_PRICE=0.45
-POLY_NO_MIN_EDGE=0.10
-POLY_NO_MIN_EV=0.16
-POLY_NO_MIN_SCORE=0.12
+POLY_NO_MAX_PRICE=0.20
+POLY_NO_MIN_EDGE=0.16
+POLY_NO_MIN_EV=0.25
+POLY_NO_MIN_SCORE=0.18
+POLY_NO_MAX_DAYS_AHEAD=0
+POLY_NO_SIZE_MULTIPLIER=0.55
+POLY_NO_EXACT_MIN_FORECAST_DISTANCE=1.20
+POLY_NO_EXACT_MIN_HISTORY_NO_PROB=0.82
+POLY_NO_METAR_BLOCK_DISTANCE=1.00
+POLY_NO_METAR_RISK_DISTANCE=1.50
 ```
 
 含义：
 
-- NO 可以买到 `0.45`，比 YES 更宽。
-- 但 NO 必须满足更高的 EV 和 score 门槛。
-- 这样可以抓更稳的确认型 NO，而不是只买极低价 NO。
+- NO 最高买入价格收紧到 `0.20`，避免中高价 NO 错一次亏太多。
+- NO 默认只做当天市场，`POLY_NO_MAX_DAYS_AHEAD=0`。
+- NO 仓位乘数为 `0.55`，即使信号很强也会比普通信号更小仓。
+- exact 类型 NO 要求预报温度距离阈值至少 `1.20°C`，避免贴边误判。
+- exact 类型 NO 要求过去 5 年同期历史上“不等于该阈值”的概率至少 `82%`。
+- 如果 METAR 实况温度已经距离阈值过近，NO 会被过滤，避免盘中临近击穿还继续买 NO。
 
 ## 历史温度
 
@@ -190,6 +201,62 @@ POLY_HISTORY_WINDOW_DAYS=15
 ```
 
 脚本会参考过去多年同日期附近的温度数据，用来判断当前阈值是否有历史支持。
+
+## 结算站点对齐
+
+Polymarket 天气市场经常按 Weather Underground 指定站点结算，例如：
+
+```text
+https://www.wunderground.com/history/daily/us/ca/san-francisco/KSFO
+```
+
+其中 `KSFO` 就是旧金山机场气象站代码。
+
+脚本会优先从 `resolutionSource` 提取这类站点代码，并使用对应机场/气象站坐标查询天气数据。这样可以减少城市中心温度和实际结算站点温度不一致造成的误判。
+
+如果市场没有提供可识别站点代码，脚本才会回退到城市 geocoding。
+
+## 站点级自校准
+
+```env
+POLY_STATION_CALIBRATION_ENABLED=true
+POLY_STATION_CALIBRATION_JSON=csv\station_calibration.json
+POLY_STATION_CALIBRATION_MIN_SAMPLES=8
+POLY_STATION_CALIBRATION_MAX_ABS_SHIFT=0.06
+```
+
+脚本支持按 `station_code` 读取校准参数，例如 `KSFO`、`ZSPD`、`RKSI`。当某个站点历史样本足够多时，可以对模型概率做轻微修正，避免所有城市/机场使用同一套置信度。
+
+示例：
+
+```json
+{
+  "KSFO": {
+    "samples": 20,
+    "yes_bias": -0.03,
+    "probability_shrink": 0.85
+  },
+  "RKSI:exact": {
+    "samples": 12,
+    "yes_bias": 0.02
+  }
+}
+```
+
+含义：
+
+- `yes_bias=-0.03`：该站点 YES 概率整体下调 3%。
+- `probability_shrink=0.85`：该站点概率向 50% 收缩，降低过度自信。
+- `站点:市场类型` 可以只针对 exact/above/below 生效。
+
+## 入场快照
+
+```env
+POLY_SNAPSHOT_ENABLED=true
+POLY_SNAPSHOT_DIR=csv\snapshots
+```
+
+每次真正记录或发送订单时，脚本会保存一份 JSON 快照，包含当时的价格、预测、历史概率、METAR 温度、仓位、EV、过滤理由等信息。这个文件用于后续复盘，不包含私钥。
 
 ## 仓位与风控
 
