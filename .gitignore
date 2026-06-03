@@ -1,11 +1,14 @@
 .env
 .env.*
+*.env
 !.env.example
 
 __pycache__/
 *.py[cod]
 
 csv/
+cache/
+wallet_research/
 *.csv
 *.log
 *order_state*.json

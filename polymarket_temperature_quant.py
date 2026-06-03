@@ -1,12 +1,16 @@
 import csv
+import hashlib
 import json
+import math
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
+from threading import Lock
 from typing import Any, Optional
 
 import requests
@@ -14,16 +18,18 @@ import requests
 USE_CLOB_V2 = False
 try:
     from py_clob_client_v2 import ClobClient, OrderArgs, OrderType, PartialCreateOrderOptions, Side
+    from py_clob_client_v2.clob_types import ApiCreds
     USE_CLOB_V2 = True
 except ImportError:
     try:
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY, SELL
         PartialCreateOrderOptions = None
         Side = None
     except ImportError:
         ClobClient = None
+        ApiCreds = None
         OrderArgs = None
         OrderType = None
         PartialCreateOrderOptions = None
@@ -66,13 +72,19 @@ GAMMA_EVENTS_URL = os.getenv("POLY_GAMMA_EVENTS_URL", "https://gamma-api.polymar
 HIGH_TEMP_PAGE_URL = os.getenv("POLY_HIGH_TEMP_PAGE_URL", "https://polymarket.com/weather/high-temperature")
 CLOB_URL = os.getenv("POLY_CLOB_URL", "https://clob.polymarket.com")
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 AVIATION_WEATHER_METAR_URL = "https://aviationweather.gov/api/data/metar"
 LOG_PATH = Path(os.getenv("POLY_LOG_CSV", str(BASE_DIR / "csv" / "polymarket_temperature_signals.csv")))
+CLV_REVIEW_PATH = Path(os.getenv("POLY_CLV_REVIEW_CSV", str(BASE_DIR / "csv" / "polymarket_temperature_clv_review.csv")))
+SHADOW_TRADE_PATH = Path(os.getenv("POLY_SHADOW_TRADE_CSV", str(BASE_DIR / "csv" / "polymarket_temperature_shadow_trades.csv")))
 ORDER_STATE_PATH = Path(os.getenv("POLY_ORDER_STATE_JSON", str(BASE_DIR / "csv" / "polymarket_temperature_order_state.json")))
 SNAPSHOT_DIR = Path(os.getenv("POLY_SNAPSHOT_DIR", str(BASE_DIR / "csv" / "snapshots")))
 STATION_CALIBRATION_PATH = Path(os.getenv("POLY_STATION_CALIBRATION_JSON", str(BASE_DIR / "csv" / "station_calibration.json")))
+STATION_MAE_CALIBRATION_PATH = Path(os.getenv("POLY_STATION_MAE_CALIBRATION_JSON", str(BASE_DIR / "csv" / "station_mae_calibration.json")))
+HISTORY_CACHE_DIR = Path(os.getenv("POLY_HISTORY_CACHE_DIR", str(BASE_DIR / "cache" / "history")))
 VERBOSE = os.getenv("POLY_VERBOSE", "false").lower() == "true"
 
 STATION_COORDS: dict[str, dict[str, float]] = {
@@ -119,6 +131,8 @@ class Config:
     scan_limit: int = int(os.getenv("POLY_SCAN_LIMIT", "200"))
     max_pages: int = int(os.getenv("POLY_MAX_PAGES", "30"))
     sleep_seconds: int = int(os.getenv("POLY_SLEEP_SECONDS", "300"))
+    scan_workers: int = int(os.getenv("POLY_SCAN_WORKERS", "8"))
+    scan_progress_interval: int = int(os.getenv("POLY_SCAN_PROGRESS_INTERVAL", "25"))
     run_once: bool = os.getenv("POLY_RUN_ONCE", "true").lower() == "true"
     only_today: bool = os.getenv("POLY_ONLY_TODAY", "true").lower() == "true"
     stop_new_orders_on_take_profit: bool = os.getenv("POLY_STOP_NEW_ORDERS_ON_TAKE_PROFIT", "true").lower() == "true"
@@ -142,19 +156,79 @@ class Config:
     yes_above_min_history_prob: Decimal = Decimal(os.getenv("POLY_YES_ABOVE_MIN_HISTORY_PROB", "0.22"))
     yes_exact_max_history_mean_distance: Decimal = Decimal(os.getenv("POLY_YES_EXACT_MAX_HISTORY_MEAN_DISTANCE", "1.20"))
     yes_city_blacklist: str = os.getenv("POLY_YES_CITY_BLACKLIST", "")
+    yes_priority_cities: str = os.getenv("POLY_YES_PRIORITY_CITIES", "")
+    yes_priority_edge_discount: Decimal = Decimal(os.getenv("POLY_YES_PRIORITY_EDGE_DISCOUNT", "0.03"))
+    yes_priority_ev_discount: Decimal = Decimal(os.getenv("POLY_YES_PRIORITY_EV_DISCOUNT", "0.03"))
+    yes_priority_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_PRIORITY_SIZE_MULTIPLIER", "1.10"))
     yes_early_max_price: Decimal = Decimal(os.getenv("POLY_YES_EARLY_MAX_PRICE", "0.10"))
     yes_early_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_EARLY_SIZE_MULTIPLIER", "0.50"))
     yes_intraday_enabled: bool = os.getenv("POLY_YES_INTRADAY_ENABLED", "true").lower() == "true"
     yes_intraday_confirm_above_price: Decimal = Decimal(os.getenv("POLY_YES_INTRADAY_CONFIRM_ABOVE_PRICE", "0.10"))
     yes_intraday_confirm_distance: Decimal = Decimal(os.getenv("POLY_YES_INTRADAY_CONFIRM_DISTANCE", "0.80"))
     yes_intraday_max_days_ahead: int = int(os.getenv("POLY_YES_INTRADAY_MAX_DAYS_AHEAD", "1"))
+    yes_low_price_require_current_metar_confirm: bool = os.getenv("POLY_YES_LOW_PRICE_REQUIRE_CURRENT_METAR_CONFIRM", "true").lower() == "true"
+    yes_low_price_current_metar_max_distance: Decimal = Decimal(os.getenv("POLY_YES_LOW_PRICE_CURRENT_METAR_MAX_DISTANCE", "0.80"))
+    yes_exact_only_mode: bool = os.getenv("POLY_YES_EXACT_ONLY_MODE", "true").lower() == "true"
+    yes_sweet_spot_min_price: Decimal = Decimal(os.getenv("POLY_YES_SWEET_SPOT_MIN_PRICE", "0.02"))
+    yes_sweet_spot_max_price: Decimal = Decimal(os.getenv("POLY_YES_SWEET_SPOT_MAX_PRICE", "0.05"))
+    yes_sweet_spot_multiplier: Decimal = Decimal(os.getenv("POLY_YES_SWEET_SPOT_MULTIPLIER", "1.20"))
+    yes_ultra_low_min_price: Decimal = Decimal(os.getenv("POLY_YES_ULTRA_LOW_MIN_PRICE", "0.002"))
+    yes_ultra_low_max_price: Decimal = Decimal(os.getenv("POLY_YES_ULTRA_LOW_MAX_PRICE", "0.01"))
+    yes_ultra_low_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_ULTRA_LOW_SIZE_MULTIPLIER", "0.35"))
+    yes_adjacent_sweep_enabled: bool = os.getenv("POLY_YES_ADJACENT_SWEEP_ENABLED", "false").lower() == "true"
+    yes_adjacent_min_price: Decimal = Decimal(os.getenv("POLY_YES_ADJACENT_MIN_PRICE", "0.02"))
+    yes_adjacent_min_count: int = int(os.getenv("POLY_YES_ADJACENT_MIN_COUNT", "2"))
+    yes_adjacent_max_step_c: Decimal = Decimal(os.getenv("POLY_YES_ADJACENT_MAX_STEP_C", "1.20"))
+    yes_adjacent_max_price: Decimal = Decimal(os.getenv("POLY_YES_ADJACENT_MAX_PRICE", "0.05"))
+    yes_adjacent_max_days_ahead: int = int(os.getenv("POLY_YES_ADJACENT_MAX_DAYS_AHEAD", "1"))
+    yes_adjacent_soft_promote: bool = os.getenv("POLY_YES_ADJACENT_SOFT_PROMOTE", "true").lower() == "true"
+    yes_adjacent_block_soft_failures: bool = os.getenv("POLY_YES_ADJACENT_BLOCK_SOFT_FAILURES", "true").lower() == "true"
+    yes_adjacent_require_station: bool = os.getenv("POLY_YES_ADJACENT_REQUIRE_STATION", "true").lower() == "true"
+    yes_adjacent_min_model_prob: Decimal = Decimal(os.getenv("POLY_YES_ADJACENT_MIN_MODEL_PROB", "0.55"))
+    yes_mispricing_accelerator_enabled: bool = os.getenv("POLY_YES_MISPRICING_ACCELERATOR_ENABLED", "true").lower() == "true"
+    yes_mispricing_max_price: Decimal = Decimal(os.getenv("POLY_YES_MISPRICING_MAX_PRICE", "0.05"))
+    yes_mispricing_near_distance: Decimal = Decimal(os.getenv("POLY_YES_MISPRICING_NEAR_DISTANCE", "1.20"))
+    yes_mispricing_strong_distance: Decimal = Decimal(os.getenv("POLY_YES_MISPRICING_STRONG_DISTANCE", "0.60"))
+    yes_mispricing_max_days_ahead: int = int(os.getenv("POLY_YES_MISPRICING_MAX_DAYS_AHEAD", "1"))
+    yes_mispricing_min_edge: Decimal = Decimal(os.getenv("POLY_YES_MISPRICING_MIN_EDGE", "0.05"))
+    yes_mispricing_min_ev: Decimal = Decimal(os.getenv("POLY_YES_MISPRICING_MIN_EV", "0.02"))
+    yes_mispricing_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_MISPRICING_SIZE_MULTIPLIER", "0.55"))
+    yes_mid_price_extra_edge: Decimal = Decimal(os.getenv("POLY_YES_MID_PRICE_EXTRA_EDGE", "0.06"))
+    yes_mid_price_extra_ev: Decimal = Decimal(os.getenv("POLY_YES_MID_PRICE_EXTRA_EV", "0.08"))
+    yes_mid_price_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_MID_PRICE_SIZE_MULTIPLIER", "0.60"))
+    yes_strong_confirm_min_price: Decimal = Decimal(os.getenv("POLY_YES_STRONG_CONFIRM_MIN_PRICE", "0.08"))
+    yes_strong_confirm_max_price: Decimal = Decimal(os.getenv("POLY_YES_STRONG_CONFIRM_MAX_PRICE", "0.10"))
+    yes_strong_confirm_extra_edge: Decimal = Decimal(os.getenv("POLY_YES_STRONG_CONFIRM_EXTRA_EDGE", "0.10"))
+    yes_strong_confirm_extra_ev: Decimal = Decimal(os.getenv("POLY_YES_STRONG_CONFIRM_EXTRA_EV", "0.12"))
+    yes_strong_confirm_min_confidence: Decimal = Decimal(os.getenv("POLY_YES_STRONG_CONFIRM_MIN_CONFIDENCE", "0.78"))
+    yes_strong_confirm_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_STRONG_CONFIRM_SIZE_MULTIPLIER", "0.35"))
+    yes_high_price_hard_cap: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_HARD_CAP", "0.10"))
+    yes_high_price_exception_max: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_EXCEPTION_MAX", "0.18"))
+    yes_high_price_exception_distance: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_EXCEPTION_DISTANCE", "0.35"))
+    yes_high_price_extra_edge: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_EXTRA_EDGE", "0.18"))
+    yes_high_price_extra_ev: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_EXTRA_EV", "0.25"))
+    yes_high_price_min_confidence: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_MIN_CONFIDENCE", "0.84"))
+    yes_high_price_exception_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_HIGH_PRICE_EXCEPTION_SIZE_MULTIPLIER", "0.20"))
     metar_enabled: bool = os.getenv("POLY_METAR_ENABLED", "true").lower() == "true"
+    resolution_source_required_above_price: Decimal = Decimal(os.getenv("POLY_RESOLUTION_SOURCE_REQUIRED_ABOVE_PRICE", "0.05"))
+    resolution_no_station_size_multiplier: Decimal = Decimal(os.getenv("POLY_RESOLUTION_NO_STATION_SIZE_MULTIPLIER", "0.20"))
+    resolution_no_metar_size_multiplier: Decimal = Decimal(os.getenv("POLY_RESOLUTION_NO_METAR_SIZE_MULTIPLIER", "0.70"))
+    resolution_verified_size_multiplier: Decimal = Decimal(os.getenv("POLY_RESOLUTION_VERIFIED_SIZE_MULTIPLIER", "1.10"))
+    resolution_no_station_extra_edge: Decimal = Decimal(os.getenv("POLY_RESOLUTION_NO_STATION_EXTRA_EDGE", "0.06"))
+    resolution_no_station_extra_ev: Decimal = Decimal(os.getenv("POLY_RESOLUTION_NO_STATION_EXTRA_EV", "0.08"))
+    resolution_no_metar_extra_edge: Decimal = Decimal(os.getenv("POLY_RESOLUTION_NO_METAR_EXTRA_EDGE", "0.03"))
+    resolution_no_metar_extra_ev: Decimal = Decimal(os.getenv("POLY_RESOLUTION_NO_METAR_EXTRA_EV", "0.04"))
     no_metar_block_distance: Decimal = Decimal(os.getenv("POLY_NO_METAR_BLOCK_DISTANCE", "1.00"))
     no_metar_risk_distance: Decimal = Decimal(os.getenv("POLY_NO_METAR_RISK_DISTANCE", "1.50"))
     calibration_enabled: bool = os.getenv("POLY_STATION_CALIBRATION_ENABLED", "true").lower() == "true"
     calibration_min_samples: int = int(os.getenv("POLY_STATION_CALIBRATION_MIN_SAMPLES", "8"))
     calibration_max_abs_shift: Decimal = Decimal(os.getenv("POLY_STATION_CALIBRATION_MAX_ABS_SHIFT", "0.06"))
     snapshot_enabled: bool = os.getenv("POLY_SNAPSHOT_ENABLED", "true").lower() == "true"
+    ensemble_enabled: bool = os.getenv("POLY_ENSEMBLE_ENABLED", "true").lower() == "true"
+    ensemble_models: str = os.getenv("POLY_ENSEMBLE_MODELS", "ecmwf_ifs04,gfs_seamless,icon_seamless")
+    ensemble_model_weights: str = os.getenv("POLY_ENSEMBLE_MODEL_WEIGHTS", "ecmwf_ifs04:0.50,gfs_seamless:0.25,icon_seamless:0.25")
+    ensemble_min_members: int = int(os.getenv("POLY_ENSEMBLE_MIN_MEMBERS", "8"))
+    ensemble_weight: Decimal = Decimal(os.getenv("POLY_ENSEMBLE_WEIGHT", "0.75"))
     no_min_edge: Decimal = Decimal(os.getenv("POLY_NO_MIN_EDGE", os.getenv("POLY_MIN_EDGE", "0.08")))
     no_min_ev: Decimal = Decimal(os.getenv("POLY_NO_MIN_EV", os.getenv("POLY_MIN_EV", "0.03")))
     no_min_score: Decimal = Decimal(os.getenv("POLY_NO_MIN_SCORE", os.getenv("POLY_MIN_SCORE", "0.04")))
@@ -162,6 +236,33 @@ class Config:
     no_size_multiplier: Decimal = Decimal(os.getenv("POLY_NO_SIZE_MULTIPLIER", "0.65"))
     no_exact_min_forecast_distance: Decimal = Decimal(os.getenv("POLY_NO_EXACT_MIN_FORECAST_DISTANCE", "1.00"))
     no_exact_min_history_no_prob: Decimal = Decimal(os.getenv("POLY_NO_EXACT_MIN_HISTORY_NO_PROB", "0.80"))
+    no_tiered_sizing_enabled: bool = os.getenv("POLY_NO_TIERED_SIZING_ENABLED", "true").lower() == "true"
+    no_tier_mid_prob: Decimal = Decimal(os.getenv("POLY_NO_TIER_MID_PROB", "0.78"))
+    no_tier_mid_edge: Decimal = Decimal(os.getenv("POLY_NO_TIER_MID_EDGE", "0.28"))
+    no_tier_mid_ev: Decimal = Decimal(os.getenv("POLY_NO_TIER_MID_EV", "0.45"))
+    no_tier_mid_multiplier: Decimal = Decimal(os.getenv("POLY_NO_TIER_MID_MULTIPLIER", "0.85"))
+    no_tier_high_prob: Decimal = Decimal(os.getenv("POLY_NO_TIER_HIGH_PROB", "0.84"))
+    no_tier_high_edge: Decimal = Decimal(os.getenv("POLY_NO_TIER_HIGH_EDGE", "0.36"))
+    no_tier_high_ev: Decimal = Decimal(os.getenv("POLY_NO_TIER_HIGH_EV", "0.70"))
+    no_tier_high_multiplier: Decimal = Decimal(os.getenv("POLY_NO_TIER_HIGH_MULTIPLIER", "1.20"))
+    no_tier_elite_prob: Decimal = Decimal(os.getenv("POLY_NO_TIER_ELITE_PROB", "0.90"))
+    no_tier_elite_edge: Decimal = Decimal(os.getenv("POLY_NO_TIER_ELITE_EDGE", "0.45"))
+    no_tier_elite_ev: Decimal = Decimal(os.getenv("POLY_NO_TIER_ELITE_EV", "1.00"))
+    no_tier_elite_multiplier: Decimal = Decimal(os.getenv("POLY_NO_TIER_ELITE_MULTIPLIER", "1.60"))
+    no_tier_min_forecast_distance: Decimal = Decimal(os.getenv("POLY_NO_TIER_MIN_FORECAST_DISTANCE", "1.80"))
+    no_tier_min_history_no_prob: Decimal = Decimal(os.getenv("POLY_NO_TIER_MIN_HISTORY_NO_PROB", "0.86"))
+    no_station_enabled: bool = os.getenv("POLY_NO_STATION_ENABLED", "false").lower() == "true"
+    no_station_min_edge: Decimal = Decimal(os.getenv("POLY_NO_STATION_MIN_EDGE", "0.30"))
+    no_station_min_ev: Decimal = Decimal(os.getenv("POLY_NO_STATION_MIN_EV", "0.60"))
+    no_station_min_score: Decimal = Decimal(os.getenv("POLY_NO_STATION_MIN_SCORE", "0.20"))
+    no_station_min_forecast_distance: Decimal = Decimal(os.getenv("POLY_NO_STATION_MIN_FORECAST_DISTANCE", "1.80"))
+    no_station_min_history_no_prob: Decimal = Decimal(os.getenv("POLY_NO_STATION_MIN_HISTORY_NO_PROB", "0.84"))
+    no_station_size_multiplier: Decimal = Decimal(os.getenv("POLY_NO_STATION_SIZE_MULTIPLIER", "0.35"))
+    yes_no_station_max_price: Decimal = Decimal(os.getenv("POLY_YES_NO_STATION_MAX_PRICE", "0.02"))
+    yes_no_station_min_history_prob: Decimal = Decimal(os.getenv("POLY_YES_NO_STATION_MIN_HISTORY_PROB", "0.30"))
+    yes_no_station_max_forecast_distance: Decimal = Decimal(os.getenv("POLY_YES_NO_STATION_MAX_FORECAST_DISTANCE", "0.60"))
+    yes_no_station_size_multiplier: Decimal = Decimal(os.getenv("POLY_YES_NO_STATION_SIZE_MULTIPLIER", "0.10"))
+    yes_no_station_allow_mispricing_override: bool = os.getenv("POLY_YES_NO_STATION_ALLOW_MISPRICING_OVERRIDE", "false").lower() == "true"
     exact_extra_edge: Decimal = Decimal(os.getenv("POLY_EXACT_EXTRA_EDGE", "0.00"))
     max_spread: Decimal = Decimal(os.getenv("POLY_MAX_SPREAD", "0.06"))
     max_price: Decimal = Decimal(os.getenv("POLY_MAX_PRICE", "0.85"))
@@ -174,8 +275,18 @@ class Config:
     kelly_fraction: Decimal = Decimal(os.getenv("POLY_KELLY_FRACTION", "0.20"))
     max_trade_pct: Decimal = Decimal(os.getenv("POLY_MAX_TRADE_PCT", "0.01"))
     probability_shrink: Decimal = Decimal(os.getenv("POLY_PROBABILITY_SHRINK", "0.70"))
+    forecast_probability_model: str = os.getenv("POLY_FORECAST_PROBABILITY_MODEL", "normal").lower()
+    forecast_mae_c: Decimal = Decimal(os.getenv("POLY_FORECAST_MAE_C", "1.50"))
+    forecast_exact_band_c: Decimal = Decimal(os.getenv("POLY_FORECAST_EXACT_BAND_C", "0.50"))
+    station_mae_calibration_enabled: bool = os.getenv("POLY_STATION_MAE_CALIBRATION_ENABLED", "true").lower() == "true"
+    station_mae_auto_update_enabled: bool = os.getenv("POLY_STATION_MAE_AUTO_UPDATE_ENABLED", "true").lower() == "true"
+    station_mae_lookback_days: int = int(os.getenv("POLY_STATION_MAE_LOOKBACK_DAYS", "90"))
+    station_mae_min_samples: int = int(os.getenv("POLY_STATION_MAE_MIN_SAMPLES", "30"))
+    station_mae_stale_days: int = int(os.getenv("POLY_STATION_MAE_STALE_DAYS", "7"))
+    station_mae_max_refreshes_per_scan: int = int(os.getenv("POLY_STATION_MAE_MAX_REFRESHES_PER_SCAN", "20"))
     min_model_confidence: Decimal = Decimal(os.getenv("POLY_MIN_MODEL_CONFIDENCE", "0.55"))
     history_enabled: bool = os.getenv("POLY_HISTORY_ENABLED", "true").lower() == "true"
+    history_disk_cache_enabled: bool = os.getenv("POLY_HISTORY_DISK_CACHE_ENABLED", "true").lower() == "true"
     history_weight: Decimal = Decimal(os.getenv("POLY_HISTORY_WEIGHT", "0.35"))
     history_lookback_days: int = int(os.getenv("POLY_HISTORY_LOOKBACK_DAYS", "365"))
     history_lookback_years: int = int(os.getenv("POLY_HISTORY_LOOKBACK_YEARS", "5"))
@@ -184,6 +295,10 @@ class Config:
     net_ev_low_price_cutoff: Decimal = Decimal(os.getenv("POLY_NET_EV_LOW_PRICE_CUTOFF", "0.08"))
     net_ev_low_price_penalty: Decimal = Decimal(os.getenv("POLY_NET_EV_LOW_PRICE_PENALTY", "0.02"))
     exact_cost_penalty: Decimal = Decimal(os.getenv("POLY_EXACT_COST_PENALTY", "0.03"))
+    score_edge_weight: Decimal = Decimal(os.getenv("POLY_SCORE_EDGE_WEIGHT", "0.40"))
+    score_ev_weight: Decimal = Decimal(os.getenv("POLY_SCORE_EV_WEIGHT", "0.45"))
+    score_spread_weight: Decimal = Decimal(os.getenv("POLY_SCORE_SPREAD_WEIGHT", "0.20"))
+    score_depth_weight: Decimal = Decimal(os.getenv("POLY_SCORE_DEPTH_WEIGHT", "0.01"))
     history_gap_reduce: Decimal = Decimal(os.getenv("POLY_HISTORY_GAP_REDUCE", "0.18"))
     history_gap_hard_cap: Decimal = Decimal(os.getenv("POLY_HISTORY_GAP_HARD_CAP", "0.35"))
     strong_signal_edge: Decimal = Decimal(os.getenv("POLY_STRONG_SIGNAL_EDGE", "0.18"))
@@ -194,6 +309,12 @@ class Config:
     exact_signal_multiplier: Decimal = Decimal(os.getenv("POLY_EXACT_SIGNAL_MULTIPLIER", "0.85"))
     yes_exact_signal_multiplier: Decimal = Decimal(os.getenv("POLY_YES_EXACT_SIGNAL_MULTIPLIER", "0.55"))
     live_min_order_size: Decimal = Decimal(os.getenv("POLY_LIVE_MIN_ORDER_SIZE", "1.00"))
+    skip_sub_min_ultra_low_orders: bool = os.getenv("POLY_SKIP_SUB_MIN_ULTRA_LOW_ORDERS", "true").lower() == "true"
+    skip_sub_min_orders: bool = os.getenv("POLY_SKIP_SUB_MIN_ORDERS", "true").lower() == "true"
+    sub_min_order_min_score: Decimal = Decimal(os.getenv("POLY_SUB_MIN_ORDER_MIN_SCORE", "0.90"))
+    sub_min_order_min_price: Decimal = Decimal(os.getenv("POLY_SUB_MIN_ORDER_MIN_PRICE", "0.02"))
+    sub_min_order_min_resolution_score: Decimal = Decimal(os.getenv("POLY_SUB_MIN_ORDER_MIN_RESOLUTION_SCORE", "1.00"))
+    skip_past_target_dates: bool = os.getenv("POLY_SKIP_PAST_TARGET_DATES", "true").lower() == "true"
     live_default_tick_size: Decimal = Decimal(os.getenv("POLY_LIVE_DEFAULT_TICK_SIZE", "0.01"))
     live_default_min_shares: Decimal = Decimal(os.getenv("POLY_LIVE_DEFAULT_MIN_SHARES", "5"))
     live_max_orders_per_scan: int = int(os.getenv("POLY_LIVE_MAX_ORDERS_PER_SCAN", "5"))
@@ -203,12 +324,41 @@ class Config:
     daily_take_profit_pct: Decimal = Decimal(os.getenv("POLY_DAILY_TAKE_PROFIT_PCT", "0.80"))
     take_profit_close_all_enabled: bool = os.getenv("POLY_TAKE_PROFIT_CLOSE_ALL_ENABLED", "true").lower() == "true"
     take_profit_close_same_day_only: bool = os.getenv("POLY_TAKE_PROFIT_CLOSE_SAME_DAY_ONLY", "true").lower() == "true"
+    yes_position_take_profit_enabled: bool = os.getenv("POLY_YES_POSITION_TAKE_PROFIT_ENABLED", "true").lower() == "true"
+    yes_tp_3x_multiple: Decimal = Decimal(os.getenv("POLY_YES_TP_3X_MULTIPLE", "3.0"))
+    yes_tp_5x_multiple: Decimal = Decimal(os.getenv("POLY_YES_TP_5X_MULTIPLE", "5.0"))
+    yes_tp_10x_multiple: Decimal = Decimal(os.getenv("POLY_YES_TP_10X_MULTIPLE", "10.0"))
+    yes_tp_3x_fraction: Decimal = Decimal(os.getenv("POLY_YES_TP_3X_FRACTION", "0.35"))
+    yes_tp_5x_fraction: Decimal = Decimal(os.getenv("POLY_YES_TP_5X_FRACTION", "0.35"))
+    yes_tp_10x_fraction: Decimal = Decimal(os.getenv("POLY_YES_TP_10X_FRACTION", "0.50"))
+    yes_tp_full_exit_price: Decimal = Decimal(os.getenv("POLY_YES_TP_FULL_EXIT_PRICE", "0.80"))
+    yes_tp_spike_mode_enabled: bool = os.getenv("POLY_YES_TP_SPIKE_MODE_ENABLED", "true").lower() == "true"
+    yes_tp_spike_price: Decimal = Decimal(os.getenv("POLY_YES_TP_SPIKE_PRICE", "0.20"))
+    yes_tp_spike_multiple: Decimal = Decimal(os.getenv("POLY_YES_TP_SPIKE_MULTIPLE", "5.0"))
+    yes_tp_spike_fraction: Decimal = Decimal(os.getenv("POLY_YES_TP_SPIKE_FRACTION", "0.80"))
+    yes_tp_spike_full_price: Decimal = Decimal(os.getenv("POLY_YES_TP_SPIKE_FULL_PRICE", "0.50"))
+    yes_tp_spike_full_multiple: Decimal = Decimal(os.getenv("POLY_YES_TP_SPIKE_FULL_MULTIPLE", "15.0"))
+    yes_tp_same_day_only: bool = os.getenv("POLY_YES_TP_SAME_DAY_ONLY", "false").lower() == "true"
+    yes_time_decay_stop_loss_enabled: bool = os.getenv("POLY_YES_TIME_DECAY_STOP_LOSS_ENABLED", "false").lower() == "true"
+    yes_time_decay_stop_loss_hours: Decimal = Decimal(os.getenv("POLY_YES_TIME_DECAY_STOP_LOSS_HOURS", "4"))
+    yes_time_decay_stop_loss_pct: Decimal = Decimal(os.getenv("POLY_YES_TIME_DECAY_STOP_LOSS_PCT", "0.60"))
+    yes_time_decay_stop_loss_min_bid: Decimal = Decimal(os.getenv("POLY_YES_TIME_DECAY_STOP_LOSS_MIN_BID", "0.01"))
+    exit_max_spread: Decimal = Decimal(os.getenv("POLY_EXIT_MAX_SPREAD", "0.05"))
+    exit_min_bid_depth_multiplier: Decimal = Decimal(os.getenv("POLY_EXIT_MIN_BID_DEPTH_MULTIPLIER", "1.00"))
+    late_entry_confirm_enabled: bool = os.getenv("POLY_LATE_ENTRY_CONFIRM_ENABLED", "true").lower() == "true"
+    late_entry_hours: Decimal = Decimal(os.getenv("POLY_LATE_ENTRY_HOURS", "4"))
+    late_entry_max_spread: Decimal = Decimal(os.getenv("POLY_LATE_ENTRY_MAX_SPREAD", "0.03"))
+    late_entry_last_hour_max_spread: Decimal = Decimal(os.getenv("POLY_LATE_ENTRY_LAST_HOUR_MAX_SPREAD", "0.04"))
+    late_entry_max_threshold_distance: Decimal = Decimal(os.getenv("POLY_LATE_ENTRY_MAX_THRESHOLD_DISTANCE", "0.60"))
     single_entry_per_slug: bool = os.getenv("POLY_SINGLE_ENTRY_PER_SLUG", "true").lower() == "true"
     auto_order: bool = os.getenv("POLY_AUTO_ORDER", "false").lower() == "true"
     private_key: str = os.getenv("POLY_PRIVATE_KEY", "")
     funder: str = os.getenv("POLY_FUNDER", "")
     signature_type: int = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
     chain_id: int = int(os.getenv("POLY_CHAIN_ID", "137"))
+    clob_api_key: str = os.getenv("CLOB_API_KEY", "")
+    clob_secret: str = os.getenv("CLOB_SECRET", "")
+    clob_pass_phrase: str = os.getenv("CLOB_PASS_PHRASE", "")
 
 
 @dataclass
@@ -224,6 +374,9 @@ class ParsedMarket:
 class ForecastPoint:
     date: str
     temp_c: Decimal
+    ensemble_prob_yes: Optional[Decimal] = None
+    ensemble_members: int = 0
+    ensemble_hits: int = 0
 
 
 @dataclass
@@ -252,6 +405,7 @@ class BookSide:
     ask: Optional[Decimal]
     spread: Optional[Decimal]
     ask_depth_at_limit: Decimal
+    bid_depth_at_best: Decimal = Decimal("0")
 
 
 def http_get(url: str, params: dict[str, Any], timeout: int = 30, retries: int = 3) -> Any:
@@ -277,10 +431,222 @@ def http_get(url: str, params: dict[str, Any], timeout: int = 30, retries: int =
 
 
 GEOCODE_CACHE: dict[str, dict[str, Any]] = {}
-HISTORY_TEMP_CACHE: dict[tuple[str, str, str, int, int], list[Decimal]] = {}
+HISTORY_TEMP_CACHE: dict[tuple[str, str, str, str, int, int], list[Decimal]] = {}
 INTRADAY_CACHE: dict[tuple[str, str], IntradayContext] = {}
 METAR_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 STATION_CALIBRATION_CACHE: Optional[dict[str, Any]] = None
+STATION_MAE_CALIBRATION_CACHE: Optional[dict[str, Any]] = None
+STATION_MAE_LOCK = Lock()
+STATION_MAE_REFRESHING: set[str] = set()
+STATION_MAE_REFRESH_COUNT = 0
+ENSEMBLE_CACHE: dict[tuple[str, str, str, str, str], tuple[Optional[Decimal], int, int]] = {}
+
+
+def parse_csv_items(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_weight_map(value: str) -> dict[str, Decimal]:
+    out: dict[str, Decimal] = {}
+    for item in parse_csv_items(value):
+        if ":" not in item:
+            continue
+        key, raw_weight = item.split(":", 1)
+        try:
+            weight = Decimal(raw_weight.strip())
+        except Exception:
+            continue
+        if weight > 0:
+            out[key.strip()] = weight
+    return out
+
+
+def history_cache_path(cache_key: tuple[str, str, str, str, int, int]) -> Path:
+    city, station_code, temp_kind, month_day, years, window = cache_key
+    label = re.sub(r"[^a-z0-9_-]+", "-", f"{city}-{station_code or 'geo'}-{temp_kind}-{month_day}".lower()).strip("-")
+    digest = hashlib.sha1("|".join(map(str, cache_key)).encode("utf-8")).hexdigest()[:12]
+    return HISTORY_CACHE_DIR / f"{label}-{years}y-{window}d-{digest}.json"
+
+
+def load_history_disk_cache(cache_key: tuple[str, str, str, str, int, int], cfg: Config) -> Optional[list[Decimal]]:
+    if not cfg.history_disk_cache_enabled:
+        return None
+    path = history_cache_path(cache_key)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        values = payload.get("temps_c", [])
+        if isinstance(values, list):
+            return [Decimal(str(value)) for value in values if value is not None]
+    except Exception as exc:
+        if VERBOSE:
+            print(f"history disk cache read failed path={path} err={exc}", flush=True)
+    return None
+
+
+def save_history_disk_cache(cache_key: tuple[str, str, str, str, int, int], temps: list[Decimal], cfg: Config) -> None:
+    if not cfg.history_disk_cache_enabled:
+        return
+    try:
+        HISTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = history_cache_path(cache_key)
+        payload = {
+            "cache_key": list(cache_key),
+            "temps_c": [str(value) for value in temps],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp_path = path.with_suffix(f".{os.getpid()}.{time.time_ns()}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception as exc:
+        if VERBOSE:
+            print(f"history disk cache write failed key={cache_key} err={exc}", flush=True)
+
+
+def load_station_mae_calibration() -> dict[str, Any]:
+    global STATION_MAE_CALIBRATION_CACHE
+    with STATION_MAE_LOCK:
+        if STATION_MAE_CALIBRATION_CACHE is not None:
+            return STATION_MAE_CALIBRATION_CACHE
+        if not STATION_MAE_CALIBRATION_PATH.exists():
+            STATION_MAE_CALIBRATION_CACHE = {}
+            return STATION_MAE_CALIBRATION_CACHE
+        try:
+            data = json.loads(STATION_MAE_CALIBRATION_PATH.read_text(encoding="utf-8"))
+            STATION_MAE_CALIBRATION_CACHE = data if isinstance(data, dict) else {}
+        except Exception:
+            STATION_MAE_CALIBRATION_CACHE = {}
+        return STATION_MAE_CALIBRATION_CACHE
+
+
+def save_station_mae_calibration(data: dict[str, Any]) -> None:
+    global STATION_MAE_CALIBRATION_CACHE
+    with STATION_MAE_LOCK:
+        STATION_MAE_CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = STATION_MAE_CALIBRATION_PATH.with_suffix(f".{os.getpid()}.{time.time_ns()}.tmp")
+        tmp_path.write_text(json.dumps(json_safe(data), ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp_path.replace(STATION_MAE_CALIBRATION_PATH)
+        STATION_MAE_CALIBRATION_CACHE = data
+
+
+def station_mae_key(city: str, station_code: str, temp_kind: str) -> str:
+    label = station_code or city.strip().lower()
+    return f"{label}:{temp_kind}"
+
+
+def station_mae_is_stale(entry: dict[str, Any], cfg: Config) -> bool:
+    updated = str(entry.get("updated_at", ""))
+    try:
+        updated_dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    except Exception:
+        return True
+    return datetime.now(timezone.utc) - updated_dt > timedelta(days=cfg.station_mae_stale_days)
+
+
+def fetch_station_mae_calibration(
+    city: str,
+    temp_kind: str,
+    station_code: str,
+    cfg: Config,
+    market: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    geo = market_weather_geo(city, market)
+    if not geo:
+        return None
+    end = datetime.now(timezone.utc).date() - timedelta(days=2)
+    start = end - timedelta(days=max(10, cfg.station_mae_lookback_days - 1))
+    field = "temperature_2m_min" if temp_kind == "min" else "temperature_2m_max"
+    params = {
+        "latitude": geo["latitude"],
+        "longitude": geo["longitude"],
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "temperature_unit": "celsius",
+        "timezone": "auto",
+    }
+    try:
+        forecast_data = http_get(OPEN_METEO_HISTORICAL_FORECAST_URL, params=params, timeout=30, retries=2)
+        actual_data = http_get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30, retries=2)
+    except Exception as exc:
+        if VERBOSE:
+            print(f"station MAE fetch failed city={city} station={station_code} err={exc}", flush=True)
+        return None
+    forecast_daily = forecast_data.get("daily", {}) if isinstance(forecast_data, dict) else {}
+    actual_daily = actual_data.get("daily", {}) if isinstance(actual_data, dict) else {}
+    forecast_dates = forecast_daily.get("time", [])
+    actual_dates = actual_daily.get("time", [])
+    forecast_values = forecast_daily.get(field, [])
+    actual_values = actual_daily.get(field, [])
+    actual_by_date = {
+        str(date): Decimal(str(value))
+        for date, value in zip(actual_dates, actual_values)
+        if value is not None
+    }
+    errors: list[Decimal] = []
+    for date, forecast_value in zip(forecast_dates, forecast_values):
+        if forecast_value is None or str(date) not in actual_by_date:
+            continue
+        errors.append(abs(Decimal(str(forecast_value)) - actual_by_date[str(date)]))
+    if len(errors) < cfg.station_mae_min_samples:
+        return None
+    mae = sum(errors, Decimal("0")) / Decimal(len(errors))
+    return {
+        "city": city,
+        "station_code": station_code,
+        "temp_kind": temp_kind,
+        "mae_c": str(mae.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)),
+        "samples": len(errors),
+        "lookback_days": cfg.station_mae_lookback_days,
+        "source": "open_meteo_historical_forecast_vs_archive",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def forecast_mae_for_market(
+    city: str,
+    temp_kind: str,
+    station_code: str,
+    cfg: Config,
+    market: Optional[dict[str, Any]] = None,
+) -> tuple[Decimal, str]:
+    global STATION_MAE_REFRESH_COUNT
+    if not cfg.station_mae_calibration_enabled:
+        return cfg.forecast_mae_c, "station MAE disabled"
+    key = station_mae_key(city, station_code, temp_kind)
+    data = load_station_mae_calibration()
+    entry = data.get(key) if isinstance(data, dict) else None
+    if isinstance(entry, dict) and not station_mae_is_stale(entry, cfg):
+        mae = dec(entry.get("mae_c"))
+        samples = int(dec(entry.get("samples")))
+        if mae > 0 and samples >= cfg.station_mae_min_samples:
+            return mae, f"station_mae key={key} samples={samples}"
+    if cfg.station_mae_auto_update_enabled:
+        with STATION_MAE_LOCK:
+            if key in STATION_MAE_REFRESHING:
+                return cfg.forecast_mae_c, f"global_mae fallback={cfg.forecast_mae_c} station_mae_refresh_inflight key={key}"
+            if (
+                cfg.station_mae_max_refreshes_per_scan >= 0
+                and STATION_MAE_REFRESH_COUNT >= cfg.station_mae_max_refreshes_per_scan
+            ):
+                return cfg.forecast_mae_c, (
+                    f"global_mae fallback={cfg.forecast_mae_c} "
+                    f"station_mae_refresh_limit={cfg.station_mae_max_refreshes_per_scan}"
+                )
+            STATION_MAE_REFRESHING.add(key)
+            STATION_MAE_REFRESH_COUNT += 1
+        try:
+            fresh = fetch_station_mae_calibration(city, temp_kind, station_code, cfg, market)
+            if fresh:
+                data = load_station_mae_calibration()
+                data[key] = fresh
+                save_station_mae_calibration(data)
+                return dec(fresh.get("mae_c")) or cfg.forecast_mae_c, f"station_mae_refreshed key={key} samples={fresh.get('samples')}"
+        finally:
+            with STATION_MAE_LOCK:
+                STATION_MAE_REFRESHING.discard(key)
+    return cfg.forecast_mae_c, f"global_mae fallback={cfg.forecast_mae_c}"
 
 
 def parse_json_list(value: Any) -> list[Any]:
@@ -304,6 +670,16 @@ def dec(value: Any) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return Decimal("0")
+
+
+def boolish_true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in ["true", "1", "yes"]
+    return bool(value)
 
 
 def clamp(value: Decimal, lo: Decimal, hi: Decimal) -> Decimal:
@@ -461,6 +837,15 @@ def is_temperature_event(event: dict[str, Any]) -> bool:
     return "highest temperature in" in text
 
 
+def is_gamma_pagination_boundary_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "422" in text
+        or "unprocessable entity" in text
+        or "offset" in text and "limit" in text
+    )
+
+
 def fetch_high_temperature_event_slugs(cfg: Config) -> list[str]:
     # The High Temp page lazy-loads/virtualizes part of the list, so the raw HTML
     # only contains the first chunk. Combine page slugs with a broad Gamma scan.
@@ -478,6 +863,13 @@ def fetch_high_temperature_event_slugs(cfg: Config) -> list[str]:
         try:
             data = http_get(GAMMA_EVENTS_URL, params)
         except Exception as exc:
+            if is_gamma_pagination_boundary_error(exc):
+                print(
+                    f"gamma_events_pagination_stop page={page + 1} offset={page * cfg.scan_limit} "
+                    f"reason=gamma_pagination_boundary error={exc}",
+                    flush=True,
+                )
+                break
             print(f"gamma events page fetch failed page={page + 1} offset={page * cfg.scan_limit} error={exc}", flush=True)
             continue
         events = data if isinstance(data, list) else data.get("data", [])
@@ -569,8 +961,8 @@ def extract_date(text: str, market: dict[str, Any]) -> Optional[str]:
 
 
 def normalize_degree_text(text: str) -> str:
-    # Gamma sometimes returns mojibake for °C as strings like "｡紊".
-    return text.replace("º", "°").replace("｡紊", "°C").replace("掳C", "°C").replace("掳F", "°F")
+    # Gamma sometimes returns mojibake for 掳C as strings like "锝＄磰".
+    return text.replace("潞", "掳").replace("锝＄磰", "掳C").replace("鎺矯", "掳C").replace("鎺矲", "掳F")
 
 
 def days_until_target(target_date: Optional[str]) -> int:
@@ -664,7 +1056,102 @@ def market_weather_geo(city: str, market: Optional[dict[str, Any]] = None) -> Op
     return station_geo_from_market(market) or geocode_city(city)
 
 
-def forecast_temperature_c(city: str, temp_kind: str, target_date: str, cfg: Config, market: Optional[dict[str, Any]] = None) -> ForecastPoint:
+def fetch_ensemble_probability(
+    city: str,
+    temp_kind: str,
+    target_date: str,
+    threshold_c: Decimal,
+    comparator: str,
+    cfg: Config,
+    market: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[Decimal], int, int]:
+    if not cfg.ensemble_enabled:
+        return None, 0, 0
+    station_code = station_code_from_resolution_source((market or {}).get("resolutionSource"))
+    cache_key = (
+        city.strip().lower(),
+        station_code,
+        target_date,
+        str(threshold_c),
+        f"{comparator}|{cfg.ensemble_models}|{cfg.ensemble_model_weights}",
+    )
+    if cache_key in ENSEMBLE_CACHE:
+        return ENSEMBLE_CACHE[cache_key]
+    geo = market_weather_geo(city, market)
+    if not geo:
+        ENSEMBLE_CACHE[cache_key] = (None, 0, 0)
+        return None, 0, 0
+    field = "temperature_2m_min" if temp_kind == "min" else "temperature_2m_max"
+    models = parse_csv_items(cfg.ensemble_models) or ["gfs_seamless"]
+    weights = parse_weight_map(cfg.ensemble_model_weights)
+    weighted_prob = Decimal("0")
+    weight_sum = Decimal("0")
+    total_members = 0
+    total_hits = 0
+
+    for model in models:
+        try:
+            data = http_get(
+                OPEN_METEO_ENSEMBLE_URL,
+                {
+                    "latitude": geo["latitude"],
+                    "longitude": geo["longitude"],
+                    "daily": field,
+                    "temperature_unit": "celsius",
+                    "timezone": "auto",
+                    "models": model,
+                },
+                timeout=30,
+                retries=2,
+            )
+        except Exception as exc:
+            if VERBOSE:
+                print(f"ensemble fetch failed model={model} city={city} station={station_code} target={target_date} error={exc}", flush=True)
+            continue
+        daily = data.get("daily", {}) if isinstance(data, dict) else {}
+        dates = daily.get("time", [])
+        if target_date not in dates:
+            continue
+        idx = dates.index(target_date)
+        values = []
+        for key, series in daily.items():
+            if key == "time" or not isinstance(series, list) or idx >= len(series):
+                continue
+            if key.startswith(f"{field}_member") and series[idx] is not None:
+                values.append(Decimal(str(series[idx])))
+        if len(values) < cfg.ensemble_min_members:
+            total_members += len(values)
+            continue
+        if comparator == "above":
+            hits = sum(1 for value in values if value >= threshold_c)
+        elif comparator == "below":
+            hits = sum(1 for value in values if value <= threshold_c)
+        else:
+            hits = sum(1 for value in values if abs(value - threshold_c) <= cfg.forecast_exact_band_c)
+        prob = (Decimal(hits) + Decimal("1")) / (Decimal(len(values)) + Decimal("2"))
+        weight = weights.get(model, Decimal("1"))
+        weighted_prob += prob * weight
+        weight_sum += weight
+        total_members += len(values)
+        total_hits += hits
+
+    if weight_sum <= 0:
+        ENSEMBLE_CACHE[cache_key] = (None, total_members, total_hits)
+        return None, total_members, total_hits
+    prob = weighted_prob / weight_sum
+    ENSEMBLE_CACHE[cache_key] = (prob, total_members, total_hits)
+    return prob, total_members, total_hits
+
+
+def forecast_temperature_c(
+    city: str,
+    temp_kind: str,
+    target_date: str,
+    cfg: Config,
+    market: Optional[dict[str, Any]] = None,
+    threshold_c: Optional[Decimal] = None,
+    comparator: Optional[str] = None,
+) -> ForecastPoint:
     geo = market_weather_geo(city, market)
     if not geo:
         raise ValueError(f"cannot geocode city={city}")
@@ -683,7 +1170,20 @@ def forecast_temperature_c(city: str, temp_kind: str, target_date: str, cfg: Con
     if not dates or not values:
         raise ValueError(f"no forecast for city={city}")
     idx = dates.index(target_date) if target_date in dates else 0
-    return ForecastPoint(date=str(dates[idx]), temp_c=Decimal(str(values[idx])))
+    ensemble_prob = None
+    ensemble_members = 0
+    ensemble_hits = 0
+    if threshold_c is not None and comparator is not None:
+        ensemble_prob, ensemble_members, ensemble_hits = fetch_ensemble_probability(
+            city, temp_kind, target_date, threshold_c, comparator, cfg, market
+        )
+    return ForecastPoint(
+        date=str(dates[idx]),
+        temp_c=Decimal(str(values[idx])),
+        ensemble_prob_yes=ensemble_prob,
+        ensemble_members=ensemble_members,
+        ensemble_hits=ensemble_hits,
+    )
 
 
 def intraday_temperature_context(city: str, target_date: str, cfg: Config, market: Optional[dict[str, Any]] = None) -> Optional[IntradayContext]:
@@ -785,6 +1285,41 @@ def yes_intraday_confirmed(parsed: ParsedMarket, ctx: Optional[IntradayContext],
     return False, f"YES below intraday not confirmed current={current} peak={peak} low={low} threshold={threshold}"
 
 
+def yes_mispricing_signal(parsed: ParsedMarket, ctx: Optional[IntradayContext], price: Decimal, target_days: int, cfg: Config) -> tuple[bool, str]:
+    if not cfg.yes_mispricing_accelerator_enabled:
+        return False, "mispricing accelerator disabled"
+    if target_days > cfg.yes_mispricing_max_days_ahead:
+        return False, f"mispricing days_ahead {target_days} > {cfg.yes_mispricing_max_days_ahead}"
+    if price > cfg.yes_mispricing_max_price:
+        return False, f"mispricing price {price} > {cfg.yes_mispricing_max_price}"
+    if ctx is None:
+        return False, "mispricing intraday context missing"
+
+    threshold = parsed.threshold_c
+    values = [v for v in [ctx.metar_c, ctx.current_c, ctx.target_peak_c] if v is not None]
+    if not values:
+        return False, "mispricing intraday temperature missing"
+
+    if parsed.comparator == "exact":
+        distance = min(abs(v - threshold) for v in values)
+        if distance <= cfg.yes_mispricing_strong_distance:
+            return True, f"mispricing strong exact distance={distance} values={values}"
+        if distance <= cfg.yes_mispricing_near_distance:
+            return True, f"mispricing near exact distance={distance} values={values}"
+        return False, f"mispricing exact distance {distance} > {cfg.yes_mispricing_near_distance}"
+
+    if parsed.comparator == "above":
+        best_gap = min(threshold - v for v in values)
+        if best_gap <= cfg.yes_mispricing_near_distance:
+            return True, f"mispricing above gap={best_gap} values={values}"
+        return False, f"mispricing above gap {best_gap} > {cfg.yes_mispricing_near_distance}"
+
+    best_gap = min(v - threshold for v in values)
+    if best_gap <= cfg.yes_mispricing_near_distance:
+        return True, f"mispricing below gap={best_gap} values={values}"
+    return False, f"mispricing below gap {best_gap} > {cfg.yes_mispricing_near_distance}"
+
+
 def historical_temperature_stats(
     city: str,
     temp_kind: str,
@@ -801,8 +1336,11 @@ def historical_temperature_stats(
         return None
 
     station_code = station_code_from_resolution_source((market or {}).get("resolutionSource"))
-    cache_key = (city.strip().lower(), station_code, temp_kind, target_date, cfg.history_lookback_years, cfg.history_window_days)
+    month_day = target_date[5:] if len(target_date) >= 10 else target_date
+    cache_key = (city.strip().lower(), station_code, temp_kind, month_day, cfg.history_lookback_years, cfg.history_window_days)
     temps = HISTORY_TEMP_CACHE.get(cache_key)
+    if temps is None:
+        temps = load_history_disk_cache(cache_key, cfg)
     if temps is None:
         target = datetime.strptime(target_date, "%Y-%m-%d").date()
         temps = []
@@ -836,7 +1374,8 @@ def historical_temperature_stats(
             daily = data.get("daily", {})
             values = daily.get("temperature_2m_min" if temp_kind == "min" else "temperature_2m_max", [])
             temps.extend(Decimal(str(value)) for value in values if value is not None)
-        HISTORY_TEMP_CACHE[cache_key] = temps
+        save_history_disk_cache(cache_key, temps, cfg)
+    HISTORY_TEMP_CACHE[cache_key] = temps
     if not temps:
         return None
 
@@ -861,11 +1400,106 @@ def historical_temperature_stats(
 
 
 def yes_city_blacklist_set(cfg: Config) -> set[str]:
+    return csv_env_set(cfg.yes_city_blacklist)
+
+
+def yes_priority_city_set(cfg: Config) -> set[str]:
+    return csv_env_set(cfg.yes_priority_cities)
+
+
+def csv_env_set(value: str) -> set[str]:
     return {
         item.strip().lower()
-        for item in cfg.yes_city_blacklist.split(",")
+        for item in value.split(",")
         if item.strip()
     }
+
+
+def yes_intraday_threshold_distance(parsed: ParsedMarket, ctx: Optional[IntradayContext]) -> Optional[Decimal]:
+    if ctx is None:
+        return None
+    values: list[Decimal] = []
+    if parsed.comparator == "exact":
+        values = [value for value in [ctx.current_c, ctx.target_peak_c, ctx.metar_c] if value is not None]
+        if not values:
+            return None
+        return min(abs(value - parsed.threshold_c) for value in values)
+    if parsed.comparator == "above":
+        values = [value for value in [ctx.current_c, ctx.target_peak_c, ctx.metar_c] if value is not None]
+        if not values:
+            return None
+        return max(Decimal("0"), parsed.threshold_c - max(values))
+    values = [value for value in [ctx.current_c, ctx.target_low_c, ctx.metar_c] if value is not None]
+    if not values:
+        return None
+    return max(Decimal("0"), min(values) - parsed.threshold_c)
+
+
+def yes_current_metar_threshold_distance(parsed: ParsedMarket, ctx: Optional[IntradayContext]) -> Optional[Decimal]:
+    if ctx is None:
+        return None
+    values = [value for value in [ctx.current_c, ctx.metar_c] if value is not None]
+    if not values:
+        return None
+    if parsed.comparator == "exact":
+        return min(abs(value - parsed.threshold_c) for value in values)
+    if parsed.comparator == "above":
+        return max(Decimal("0"), parsed.threshold_c - max(values))
+    return max(Decimal("0"), min(values) - parsed.threshold_c)
+
+
+def resolution_quality(station_code: str, intraday_ctx: Optional[IntradayContext]) -> tuple[str, Decimal]:
+    if not station_code:
+        return "no_station", Decimal("0.35")
+    if intraday_ctx is None or intraday_ctx.metar_c is None:
+        return "station_no_metar", Decimal("0.65")
+    return "station_metar", Decimal("1.00")
+
+
+def normal_cdf(x: float, mean: float, std: float) -> float:
+    if std <= 0:
+        return 1.0 if x >= mean else 0.0
+    z = (x - mean) / (std * math.sqrt(2.0))
+    return 0.5 * (1.0 + math.erf(z))
+
+
+def probability_from_normal_error(
+    forecast_c: Decimal,
+    threshold_c: Decimal,
+    comparator: str,
+    mae_c: Decimal,
+    exact_band_c: Decimal,
+) -> Decimal:
+    # For a normal distribution, MAE = sigma * sqrt(2 / pi).
+    std = max(float(mae_c) * math.sqrt(math.pi / 2.0), 0.05)
+    mean = float(forecast_c)
+    threshold = float(threshold_c)
+    band = float(max(exact_band_c, Decimal("0.01")))
+    if comparator == "above":
+        prob = 1.0 - normal_cdf(threshold, mean, std)
+    elif comparator == "below":
+        prob = normal_cdf(threshold, mean, std)
+    else:
+        prob = normal_cdf(threshold + band, mean, std) - normal_cdf(threshold - band, mean, std)
+    return Decimal(str(clamp(Decimal(str(prob)), Decimal("0.01"), Decimal("0.99"))))
+
+
+def probability_from_forecast(
+    forecast_c: Decimal,
+    threshold_c: Decimal,
+    comparator: str,
+    cfg: Config,
+    mae_c: Optional[Decimal] = None,
+) -> Decimal:
+    if cfg.forecast_probability_model == "normal":
+        return probability_from_normal_error(
+            forecast_c,
+            threshold_c,
+            comparator,
+            mae_c or cfg.forecast_mae_c,
+            cfg.forecast_exact_band_c,
+        )
+    return probability_from_band(forecast_c, threshold_c, comparator, cfg.temp_band_c)
 
 
 def probability_from_band(forecast_c: Decimal, threshold_c: Decimal, comparator: str, band_c: Decimal) -> Decimal:
@@ -908,7 +1542,7 @@ def get_order_book(token_id: str) -> Optional[dict[str, Any]]:
 
 def book_side(book: Optional[dict[str, Any]], max_price: Decimal) -> BookSide:
     if not book:
-        return BookSide(None, None, None, Decimal("0"))
+        return BookSide(None, None, None, Decimal("0"), Decimal("0"))
     bids = book.get("bids", [])
     asks = book.get("asks", [])
 
@@ -924,7 +1558,14 @@ def book_side(book: Optional[dict[str, Any]], max_price: Decimal) -> BookSide:
         size = Decimal(str(level.get("size", "0")))
         if price <= max_price:
             depth += size
-    return BookSide(bid, ask, spread, depth)
+    bid_depth = Decimal("0")
+    if bid is not None:
+        for level in bids:
+            price = Decimal(str(level["price"]))
+            size = Decimal(str(level.get("size", "0")))
+            if price == bid:
+                bid_depth += size
+    return BookSide(bid, ask, spread, depth, bid_depth)
 
 
 def pick_tokens(market: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
@@ -951,11 +1592,16 @@ def kelly_size(prob: Decimal, price: Decimal, cfg: Config) -> tuple[Decimal, Dec
     return frac, dollars
 
 
-def score(edge: Decimal, ev: Decimal, spread: Optional[Decimal], depth: Decimal, size: Decimal) -> Decimal:
-    depth_bonus = min(depth / max(size, Decimal("1")), Decimal("3")) / Decimal("100")
+def score(edge: Decimal, ev: Decimal, spread: Optional[Decimal], depth: Decimal, size: Decimal, cfg: Config) -> Decimal:
+    depth_bonus = min(depth / max(size, Decimal("1")), Decimal("3")) * cfg.score_depth_weight
     spread_penalty = spread if spread is not None else Decimal("1")
     ev_component = clamp(ev, Decimal("-1"), Decimal("1.50"))
-    return (edge * Decimal("0.40")) + (ev_component * Decimal("0.45")) - (spread_penalty * Decimal("0.20")) + depth_bonus
+    return (
+        edge * cfg.score_edge_weight
+        + ev_component * cfg.score_ev_weight
+        - spread_penalty * cfg.score_spread_weight
+        + depth_bonus
+    )
 
 
 def execution_cost_penalty(price: Decimal, spread: Optional[Decimal], comparator: str, cfg: Config) -> Decimal:
@@ -993,6 +1639,40 @@ def signal_size_multiplier(
     return clamp(multiplier, Decimal("0.35"), Decimal("2.00"))
 
 
+def no_tiered_size_multiplier(
+    prob: Decimal,
+    edge: Decimal,
+    ev: Decimal,
+    comparator: str,
+    forecast_distance: Decimal,
+    history_no_prob: Optional[Decimal],
+    cfg: Config,
+) -> tuple[Decimal, str]:
+    if not cfg.no_tiered_sizing_enabled:
+        return cfg.no_size_multiplier, "NO tier disabled"
+    if comparator == "exact":
+        if forecast_distance < cfg.no_tier_min_forecast_distance:
+            return cfg.no_size_multiplier, f"base forecast_distance={forecast_distance:.4f}"
+        if history_no_prob is not None and history_no_prob < cfg.no_tier_min_history_no_prob:
+            return cfg.no_size_multiplier, f"base history_no_prob={history_no_prob:.4f}"
+
+    tier = "base"
+    multiplier = cfg.no_size_multiplier
+    if prob >= cfg.no_tier_elite_prob and edge >= cfg.no_tier_elite_edge and ev >= cfg.no_tier_elite_ev:
+        tier = "elite"
+        multiplier = cfg.no_tier_elite_multiplier
+    elif prob >= cfg.no_tier_high_prob and edge >= cfg.no_tier_high_edge and ev >= cfg.no_tier_high_ev:
+        tier = "high"
+        multiplier = cfg.no_tier_high_multiplier
+    elif prob >= cfg.no_tier_mid_prob and edge >= cfg.no_tier_mid_edge and ev >= cfg.no_tier_mid_ev:
+        tier = "mid"
+        multiplier = cfg.no_tier_mid_multiplier
+    return multiplier, (
+        f"{tier} prob={prob:.4f} edge={edge:.4f} ev={ev:.4f} "
+        f"forecast_distance={forecast_distance:.4f} history_no_prob={history_no_prob if history_no_prob is not None else 'NA'}"
+    )
+
+
 def side_thresholds(side: str, cfg: Config) -> tuple[Decimal, Decimal, Decimal]:
     if side == "YES":
         return cfg.yes_min_edge, cfg.yes_min_ev, cfg.yes_min_score
@@ -1015,6 +1695,10 @@ def build_candidate(
     comparator: str,
     history_prob_yes: Optional[Decimal],
     forecast_yes: Decimal,
+    forecast_distance: Decimal,
+    no_station: bool,
+    priority_city: bool,
+    resolution_tier: str,
     cfg: Config,
 ) -> dict[str, Any]:
     edge = prob - price
@@ -1029,12 +1713,49 @@ def build_candidate(
     size_multiplier = signal_size_multiplier(prob, edge, ev, comparator, side, history_gap, cfg)
     if side == "YES" and price <= cfg.yes_early_max_price:
         size_multiplier *= cfg.yes_early_size_multiplier
+    if side == "YES" and price <= cfg.yes_ultra_low_max_price:
+        size_multiplier *= cfg.yes_ultra_low_size_multiplier
+    if side == "YES" and cfg.yes_sweet_spot_min_price <= price <= cfg.yes_sweet_spot_max_price:
+        size_multiplier *= cfg.yes_sweet_spot_multiplier
+    if side == "YES" and cfg.yes_sweet_spot_max_price < price < cfg.yes_strong_confirm_min_price:
+        size_multiplier *= cfg.yes_mid_price_size_multiplier
+    if side == "YES" and cfg.yes_strong_confirm_min_price <= price <= cfg.yes_strong_confirm_max_price:
+        size_multiplier *= cfg.yes_strong_confirm_size_multiplier
+    if side == "YES" and price > cfg.yes_high_price_hard_cap:
+        size_multiplier *= cfg.yes_high_price_exception_size_multiplier
+    if side == "YES" and priority_city:
+        size_multiplier *= cfg.yes_priority_size_multiplier
+    if side == "YES":
+        if resolution_tier == "no_station":
+            size_multiplier *= cfg.resolution_no_station_size_multiplier
+        elif resolution_tier == "station_no_metar":
+            size_multiplier *= cfg.resolution_no_metar_size_multiplier
+        elif resolution_tier == "station_metar":
+            size_multiplier *= cfg.resolution_verified_size_multiplier
+    if side == "YES" and price <= cfg.yes_mispricing_max_price:
+        size_multiplier *= cfg.yes_mispricing_size_multiplier
+    if no_station:
+        if side == "YES":
+            size_multiplier *= cfg.yes_no_station_size_multiplier
+        else:
+            size_multiplier *= cfg.no_station_size_multiplier
+    size_tier_note = ""
     if side == "NO":
-        size_multiplier *= cfg.no_size_multiplier
-    size_multiplier = clamp(size_multiplier, Decimal("0.20"), Decimal("2.00"))
+        no_mult, size_tier_note = no_tiered_size_multiplier(
+            prob,
+            edge,
+            ev,
+            comparator,
+            forecast_distance,
+            history_prob_yes,
+            cfg,
+        )
+        size_multiplier *= no_mult
+    min_size_multiplier = Decimal("0.05") if no_station and side == "YES" else Decimal("0.20")
+    size_multiplier = clamp(size_multiplier, min_size_multiplier, Decimal("2.00"))
     max_dollars = (cfg.bankroll * cfg.max_trade_pct).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     order_size = min((base_order_size * size_multiplier).quantize(Decimal("0.01"), rounding=ROUND_DOWN), max_dollars)
-    sig_score = score(edge, ev, spread, depth, max(order_size, Decimal("1")))
+    sig_score = score(edge, ev, spread, depth, max(order_size, Decimal("1")), cfg)
     certainty = abs(prob - Decimal("0.5")) * Decimal("2")
     # Selection score chooses the better side before threshold checks.
     selection_score = sig_score + (certainty / Decimal("20")) + (clamp(ev, Decimal("-1"), Decimal("1.50")) / Decimal("8"))
@@ -1055,6 +1776,7 @@ def build_candidate(
         "score": sig_score,
         "certainty": certainty,
         "history_gap": history_gap,
+        "size_tier": size_tier_note,
         "selection_score": selection_score,
     }
 
@@ -1064,6 +1786,10 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
     if not parsed:
         return None
     target_days = days_until_target(parsed.target_date)
+    if cfg.skip_past_target_dates and target_days < 0:
+        if VERBOSE:
+            print(f"market skipped past target_date slug={market.get('slug')} target_date={parsed.target_date}", flush=True)
+        return None
     if cfg.only_today and target_days != 0:
         return None
     accepting_orders = market_accepting_orders(market)
@@ -1074,8 +1800,26 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         return None
     yes_book = book_side(get_order_book(yes_token), cfg.yes_max_price)
     no_book = book_side(get_order_book(no_token), cfg.no_max_price)
-    forecast = forecast_temperature_c(parsed.city, parsed.temp_kind, parsed.target_date, cfg, market)
-    forecast_yes = probability_from_band(forecast.temp_c, parsed.threshold_c, parsed.comparator, cfg.temp_band_c)
+    forecast = forecast_temperature_c(
+        parsed.city,
+        parsed.temp_kind,
+        parsed.target_date,
+        cfg,
+        market,
+        threshold_c=parsed.threshold_c,
+        comparator=parsed.comparator,
+    )
+    station_code = station_code_from_resolution_source(market.get("resolutionSource"))
+    forecast_mae_c, forecast_mae_note = forecast_mae_for_market(parsed.city, parsed.temp_kind, station_code, cfg, market)
+    band_prob_yes = probability_from_forecast(forecast.temp_c, parsed.threshold_c, parsed.comparator, cfg, forecast_mae_c)
+    if forecast.ensemble_prob_yes is not None:
+        ew = clamp(cfg.ensemble_weight, Decimal("0"), Decimal("1"))
+        forecast_yes = forecast.ensemble_prob_yes * ew + band_prob_yes * (Decimal("1") - ew)
+        forecast_source = f"ensemble({forecast.ensemble_hits}/{forecast.ensemble_members})+band"
+    else:
+        forecast_yes = band_prob_yes
+        forecast_source = "band"
+    forecast_distance = abs(forecast.temp_c - parsed.threshold_c)
     intraday_ctx = None
     intraday_ok = False
     intraday_reason = "intraday disabled"
@@ -1091,6 +1835,8 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
             intraday_reason = f"YES intraday fetch failed: {exc}"
             if VERBOSE:
                 print(f"intraday fetch failed city={parsed.city} target={parsed.target_date} error={exc}", flush=True)
+    yes_mispricing_ok = False
+    yes_mispricing_reason = "mispricing not evaluated"
     history = historical_temperature_stats(
         parsed.city,
         parsed.temp_kind,
@@ -1101,11 +1847,14 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         market,
     )
     raw_yes = blend_probabilities(forecast_yes, history, cfg)
-    station_code = station_code_from_resolution_source(market.get("resolutionSource"))
+    no_station = not bool(station_code)
+    resolution_tier, resolution_score = resolution_quality(station_code, intraday_ctx)
     raw_yes, calibration_note = apply_station_calibration(raw_yes, station_code, parsed.comparator, cfg)
     model_yes = shrink_probability(raw_yes, cfg.probability_shrink)
     model_no = Decimal("1") - model_yes
     forecast_no = Decimal("1") - forecast_yes
+    priority_cities = yes_priority_city_set(cfg)
+    is_priority_city = parsed.city.strip().lower() in priority_cities
 
     candidates = []
     if yes_book.ask is not None:
@@ -1120,6 +1869,10 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
                 parsed.comparator,
                 history.prob_yes if history else None,
                 forecast_yes,
+                forecast_distance,
+                no_station,
+                is_priority_city,
+                resolution_tier,
                 cfg,
             )
         )
@@ -1135,6 +1888,10 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
                 parsed.comparator,
                 (Decimal("1") - history.prob_yes) if history else None,
                 forecast_no,
+                forecast_distance,
+                no_station,
+                False,
+                resolution_tier,
                 cfg,
             )
         )
@@ -1147,6 +1904,9 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
 
     volume = market_volume(market)
     yes_blacklist = yes_city_blacklist_set(cfg)
+    intraday_threshold_distance = yes_intraday_threshold_distance(parsed, intraday_ctx)
+    current_metar_threshold_distance = yes_current_metar_threshold_distance(parsed, intraday_ctx)
+    hours_left = hours_until_target_end(parsed.target_date)
 
     def candidate_reasons(item: dict[str, Any]) -> list[str]:
         item_min_edge, item_min_ev, item_min_score = side_thresholds(item["side"], cfg)
@@ -1155,29 +1915,129 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         if item["side"] == "YES" and parsed.comparator == "exact":
             item_min_edge += cfg.yes_exact_extra_edge
             item_min_ev += cfg.yes_exact_extra_ev
+            if is_priority_city and cfg.yes_sweet_spot_min_price <= item["price"] <= cfg.yes_sweet_spot_max_price:
+                item_min_edge = max(Decimal("0"), item_min_edge - cfg.yes_priority_edge_discount)
+                item_min_ev = max(Decimal("0"), item_min_ev - cfg.yes_priority_ev_discount)
+        item_mispricing_ok = False
+        item_mispricing_reason = "mispricing not evaluated"
+        if item["side"] == "YES":
+            item_mispricing_ok, item_mispricing_reason = yes_mispricing_signal(parsed, intraday_ctx, item["price"], target_days, cfg)
+            item["mispricing_ok"] = item_mispricing_ok
+            item["mispricing_reason"] = item_mispricing_reason
+            if item_mispricing_ok:
+                item_min_edge = min(item_min_edge, cfg.yes_mispricing_min_edge)
+                item_min_ev = min(item_min_ev, cfg.yes_mispricing_min_ev)
+                item_min_score = min(item_min_score, cfg.yes_min_score)
         min_depth_for_item = max(item["order_size"], Decimal("1")) * cfg.min_depth_multiplier
         out = []
         if forecast.date != parsed.target_date:
             out.append(f"target_date {parsed.target_date} not in forecast window, using {forecast.date}")
-        if max(item["prob"], Decimal("1") - item["prob"]) < cfg.min_model_confidence:
+        if not item_mispricing_ok and max(item["prob"], Decimal("1") - item["prob"]) < cfg.min_model_confidence:
             out.append(f"confidence {item['prob']:.4f} < {cfg.min_model_confidence}")
+        if (
+            item["side"] == "YES"
+            and cfg.late_entry_confirm_enabled
+            and hours_left is not None
+            and Decimal("0") <= hours_left <= cfg.late_entry_hours
+        ):
+            max_late_spread = cfg.late_entry_last_hour_max_spread if hours_left <= Decimal("1") else cfg.late_entry_max_spread
+            if item["spread"] is None or item["spread"] > max_late_spread:
+                out.append(f"YES late-entry spread {item['spread']} > {max_late_spread}")
+            if not intraday_ok:
+                out.append(f"YES late-entry intraday required: {intraday_reason}")
+            if intraday_threshold_distance is None:
+                out.append("YES late-entry missing METAR/hourly distance")
+            elif intraday_threshold_distance > cfg.late_entry_max_threshold_distance:
+                out.append(
+                    f"YES late-entry threshold_distance {intraday_threshold_distance:.4f} > {cfg.late_entry_max_threshold_distance}"
+                )
         if item["side"] == "YES" and parsed.city.strip().lower() in yes_blacklist:
             out.append(f"YES city blacklisted: {parsed.city}")
+        if item["side"] == "YES" and cfg.yes_exact_only_mode and parsed.comparator != "exact":
+            out.append(f"YES exact-only mode blocks comparator={parsed.comparator}")
+        if (
+            item["side"] == "YES"
+            and parsed.comparator == "exact"
+            and cfg.yes_low_price_require_current_metar_confirm
+            and target_days == 0
+            and cfg.yes_sweet_spot_min_price <= item["price"] <= cfg.yes_sweet_spot_max_price
+        ):
+            if current_metar_threshold_distance is None:
+                out.append("YES low-price exact missing current METAR/hourly distance")
+            elif current_metar_threshold_distance > cfg.yes_low_price_current_metar_max_distance:
+                out.append(
+                    f"YES low-price exact current_METAR_distance {current_metar_threshold_distance:.4f} "
+                    f"> {cfg.yes_low_price_current_metar_max_distance}"
+                )
+        if item["side"] == "YES" and resolution_tier == "no_station":
+            item_min_edge += cfg.resolution_no_station_extra_edge
+            item_min_ev += cfg.resolution_no_station_extra_ev
+            if item["price"] > cfg.resolution_source_required_above_price:
+                out.append(
+                    f"YES resolution source missing above price {item['price']} > {cfg.resolution_source_required_above_price}"
+                )
+        elif item["side"] == "YES" and resolution_tier == "station_no_metar":
+            item_min_edge += cfg.resolution_no_metar_extra_edge
+            item_min_ev += cfg.resolution_no_metar_extra_ev
+        if item["side"] == "YES" and cfg.yes_sweet_spot_max_price < item["price"] < cfg.yes_strong_confirm_min_price:
+            item_min_edge += cfg.yes_mid_price_extra_edge
+            item_min_ev += cfg.yes_mid_price_extra_ev
+        if item["side"] == "YES" and cfg.yes_strong_confirm_min_price <= item["price"] <= cfg.yes_strong_confirm_max_price:
+            item_min_edge += cfg.yes_strong_confirm_extra_edge
+            item_min_ev += cfg.yes_strong_confirm_extra_ev
+            if item["prob"] < cfg.yes_strong_confirm_min_confidence:
+                out.append(f"YES strong-confirm confidence {item['prob']:.4f} < {cfg.yes_strong_confirm_min_confidence}")
+            if not intraday_ok:
+                out.append(f"YES strong-confirm intraday required: {intraday_reason}")
+        if item["side"] == "YES" and item["price"] > cfg.yes_high_price_hard_cap:
+            item_min_edge += cfg.yes_high_price_extra_edge
+            item_min_ev += cfg.yes_high_price_extra_ev
+            if item["price"] > cfg.yes_high_price_exception_max:
+                out.append(f"YES high-price exception price {item['price']} > {cfg.yes_high_price_exception_max}")
+            if item["prob"] < cfg.yes_high_price_min_confidence:
+                out.append(f"YES high-price confidence {item['prob']:.4f} < {cfg.yes_high_price_min_confidence}")
+            if intraday_threshold_distance is None:
+                out.append("YES high-price exception missing METAR/hourly distance")
+            elif intraday_threshold_distance > cfg.yes_high_price_exception_distance:
+                out.append(
+                    f"YES high-price METAR/hourly distance {intraday_threshold_distance:.4f} > {cfg.yes_high_price_exception_distance}"
+                )
+            if not intraday_ok:
+                out.append(f"YES high-price intraday required: {intraday_reason}")
+        if no_station and item["side"] == "YES":
+            strict_no_station = not cfg.yes_no_station_allow_mispricing_override
+            if item["price"] > cfg.yes_no_station_max_price:
+                out.append(f"YES no-station price {item['price']} > {cfg.yes_no_station_max_price}")
+            if (strict_no_station or not item_mispricing_ok) and forecast_distance > cfg.yes_no_station_max_forecast_distance:
+                out.append(
+                    f"YES no-station forecast_distance {forecast_distance:.4f} > {cfg.yes_no_station_max_forecast_distance}"
+                )
+            if (strict_no_station or not item_mispricing_ok) and history and history.prob_yes < cfg.yes_no_station_min_history_prob:
+                out.append(f"YES no-station history_prob {history.prob_yes:.4f} < {cfg.yes_no_station_min_history_prob}")
         if item["side"] == "YES" and parsed.comparator == "exact":
-            if item["prob"] < cfg.yes_exact_min_confidence:
+            if not item_mispricing_ok and item["prob"] < cfg.yes_exact_min_confidence:
                 out.append(f"YES exact confidence {item['prob']:.4f} < {cfg.yes_exact_min_confidence}")
-            if item["price"] < cfg.yes_exact_min_price:
-                out.append(f"YES exact price {item['price']} < {cfg.yes_exact_min_price}")
+            yes_exact_min_price = cfg.yes_ultra_low_min_price if item["price"] <= cfg.yes_ultra_low_max_price else cfg.yes_exact_min_price
+            if item["price"] < yes_exact_min_price:
+                out.append(f"YES exact price {item['price']} < {yes_exact_min_price}")
+            if (
+                cfg.skip_sub_min_ultra_low_orders
+                and item["price"] <= cfg.yes_ultra_low_max_price
+                and item["order_size"] < cfg.live_min_order_size
+            ):
+                out.append(
+                    f"YES ultra-low sub-min order_size {item['order_size']} < live_min_order_size {cfg.live_min_order_size}"
+                )
             if target_days > cfg.yes_exact_max_days_ahead:
                 out.append(f"YES exact days_ahead {target_days} > {cfg.yes_exact_max_days_ahead}")
-            if abs(forecast.temp_c - parsed.threshold_c) > cfg.yes_exact_max_forecast_distance:
+            if not item_mispricing_ok and abs(forecast.temp_c - parsed.threshold_c) > cfg.yes_exact_max_forecast_distance:
                 out.append(
                     f"YES exact forecast_distance {abs(forecast.temp_c - parsed.threshold_c):.4f} > {cfg.yes_exact_max_forecast_distance}"
                 )
             if history:
-                if history.prob_yes < cfg.yes_exact_min_history_prob:
+                if not item_mispricing_ok and history.prob_yes < cfg.yes_exact_min_history_prob:
                     out.append(f"YES exact history_prob {history.prob_yes:.4f} < {cfg.yes_exact_min_history_prob}")
-                if abs(history.avg_c - parsed.threshold_c) > cfg.yes_exact_max_history_mean_distance:
+                if not item_mispricing_ok and abs(history.avg_c - parsed.threshold_c) > cfg.yes_exact_max_history_mean_distance:
                     out.append(
                         f"YES exact history_mean_distance {abs(history.avg_c - parsed.threshold_c):.4f} > {cfg.yes_exact_max_history_mean_distance}"
                     )
@@ -1192,13 +2052,31 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
             if history.prob_yes < cfg.yes_above_min_history_prob:
                 out.append(f"YES above history_prob {history.prob_yes:.4f} < {cfg.yes_above_min_history_prob}")
         if item["side"] == "NO":
+            if no_station:
+                if not cfg.no_station_enabled:
+                    out.append("NO no-station disabled")
+                if item["edge"] < cfg.no_station_min_edge:
+                    out.append(f"NO no-station edge {item['edge']:.4f} < {cfg.no_station_min_edge}")
+                if item["ev"] < cfg.no_station_min_ev:
+                    out.append(f"NO no-station ev {item['ev']:.4f} < {cfg.no_station_min_ev}")
+                if item["score"] < cfg.no_station_min_score:
+                    out.append(f"NO no-station score {item['score']:.4f} < {cfg.no_station_min_score}")
+                if forecast_distance < cfg.no_station_min_forecast_distance:
+                    out.append(
+                        f"NO no-station forecast_distance {forecast_distance:.4f} < {cfg.no_station_min_forecast_distance}"
+                    )
+                if history:
+                    history_no_prob = Decimal("1") - history.prob_yes
+                    if history_no_prob < cfg.no_station_min_history_no_prob:
+                        out.append(
+                            f"NO no-station history_no_prob {history_no_prob:.4f} < {cfg.no_station_min_history_no_prob}"
+                        )
             metar_risk = no_metar_risk_reason(parsed, intraday_ctx, cfg)
             if metar_risk:
                 out.append(metar_risk)
             if target_days > cfg.no_max_days_ahead:
                 out.append(f"NO days_ahead {target_days} > {cfg.no_max_days_ahead}")
             if parsed.comparator == "exact":
-                forecast_distance = abs(forecast.temp_c - parsed.threshold_c)
                 if forecast_distance < cfg.no_exact_min_forecast_distance:
                     out.append(
                         f"NO exact forecast_distance {forecast_distance:.4f} < {cfg.no_exact_min_forecast_distance}"
@@ -1217,14 +2095,15 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
             out.append(f"{item['side']} score {item['score']:.4f} < {item_min_score}")
         if not accepting_orders:
             out.append("market not accepting orders")
-        if item["history_gap"] > cfg.history_gap_hard_cap:
+        if not item_mispricing_ok and item["history_gap"] > cfg.history_gap_hard_cap:
             out.append(f"history_gap {item['history_gap']:.4f} > {cfg.history_gap_hard_cap}")
-        if item["side"] == "YES" and parsed.comparator == "exact" and item["history_gap"] > cfg.yes_exact_max_history_gap:
+        if not item_mispricing_ok and item["side"] == "YES" and parsed.comparator == "exact" and item["history_gap"] > cfg.yes_exact_max_history_gap:
             out.append(f"YES exact history_gap {item['history_gap']:.4f} > {cfg.yes_exact_max_history_gap}")
         if item["spread"] is None or item["spread"] > cfg.max_spread:
             out.append(f"spread {item['spread']} > {cfg.max_spread}")
-        if item["price"] < cfg.min_price:
-            out.append(f"price {item['price']} < {cfg.min_price}")
+        min_allowed_price = cfg.yes_ultra_low_min_price if (item["side"] == "YES" and parsed.comparator == "exact" and item["price"] <= cfg.yes_ultra_low_max_price) else cfg.min_price
+        if item["price"] < min_allowed_price:
+            out.append(f"price {item['price']} < {min_allowed_price}")
         side_max_price = cfg.yes_max_price if item["side"] == "YES" else cfg.no_max_price
         if item["price"] > side_max_price:
             out.append(f"{item['side']} price {item['price']} > {side_max_price}")
@@ -1265,6 +2144,8 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         "forecast_date": forecast.date,
         "target_date": parsed.target_date,
         "forecast_c": forecast.temp_c,
+        "forecast_mae_c": forecast_mae_c,
+        "forecast_mae_note": forecast_mae_note,
         "threshold_c": parsed.threshold_c,
         "comparator": parsed.comparator,
         "model_yes_raw": raw_yes,
@@ -1279,20 +2160,34 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
         "ev": ev,
         "kelly_fraction": kfrac,
         "size_multiplier": candidate["size_multiplier"],
+        "size_tier": candidate.get("size_tier", ""),
         "order_size": order_size,
         "score": sig_score,
         "minimum_tick_size": minimum_tick_size,
         "minimum_order_size": minimum_order_size,
         "accepting_orders": accepting_orders,
+        "target_days": target_days,
+        "history_gap": candidate.get("history_gap", Decimal("0")),
+        "resolution_tier": resolution_tier,
+        "resolution_score": resolution_score,
+        "mispricing_ok": candidate.get("mispricing_ok", False),
+        "mispricing_reason": candidate.get("mispricing_reason", ""),
         "metar_c": intraday_ctx.metar_c if intraday_ctx else None,
         "metar_station": intraday_ctx.metar_station if intraday_ctx else "",
         "metar_time": intraday_ctx.metar_time if intraday_ctx else "",
+        "forecast_source": forecast_source,
+        "ensemble_prob_yes": forecast.ensemble_prob_yes,
+        "ensemble_members": forecast.ensemble_members,
+        "ensemble_hits": forecast.ensemble_hits,
         "calibration": calibration_note,
         "reason": "; ".join(reasons) if reasons else (
-            f"best_side={side} forecast_prob_yes={forecast_yes:.4f} "
+            f"best_side={side} forecast_source={forecast_source} forecast_prob_yes={forecast_yes:.4f} "
+            f"forecast_mae={forecast_mae_c}:{forecast_mae_note} "
             f"history_prob_yes={(history.prob_yes if history else Decimal('0')):.4f} "
             f"history_samples={(history.samples if history else 0)} gross_ev={candidate['gross_ev']:.4f} "
             f"net_ev={ev:.4f} size_multiplier={candidate['size_multiplier']:.2f} "
+            f"size_tier={candidate.get('size_tier','')} "
+            f"mispricing={candidate.get('mispricing_ok', False)}:{candidate.get('mispricing_reason', '')} "
             f"yes_mode={'early_low_price' if side == 'YES' and price <= cfg.yes_early_max_price else ('intraday_confirmed' if side == 'YES' and intraday_ok else 'standard')} "
             f"intraday={intraday_reason} "
             f"metar={intraday_ctx.metar_c if intraday_ctx else None}@{intraday_ctx.metar_station if intraday_ctx else ''} "
@@ -1302,16 +2197,130 @@ def build_signal(market: dict[str, Any], cfg: Config) -> Optional[dict[str, Any]
     }
 
 
+SIGNAL_LOG_HEADER = [
+    "ts", "slug", "city", "station_code", "side", "action", "forecast_date", "target_date", "forecast_c", "threshold_c",
+    "comparator", "model_yes_raw", "model_yes", "model_prob_side", "market_price", "spread", "depth",
+    "volume", "edge", "gross_ev", "ev", "kelly_fraction", "size_multiplier", "order_size", "score",
+    "minimum_tick_size", "minimum_order_size", "accepting_orders", "target_days", "history_gap",
+    "resolution_tier", "resolution_score", "forecast_source", "ensemble_prob_yes", "ensemble_members",
+    "ensemble_hits", "metar_c", "metar_station", "metar_time", "calibration", "mispricing_ok",
+    "mispricing_reason", "entry_model_prob", "entry_price", "clv_1h", "clv_3h", "clv_final",
+    "outcome", "brier", "reason", "question",
+]
+
+
 def ensure_log() -> None:
-    if LOG_PATH.exists():
-        return
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if LOG_PATH.exists():
+        try:
+            with LOG_PATH.open("r", newline="", encoding="utf-8") as f:
+                existing_header = next(csv.reader(f), [])
+            if existing_header == SIGNAL_LOG_HEADER:
+                return
+            backup = LOG_PATH.with_name(
+                f"{LOG_PATH.stem}_legacy_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}{LOG_PATH.suffix}"
+            )
+            LOG_PATH.replace(backup)
+            print(f"LOG_SCHEMA_UPGRADED old_log={backup} new_log={LOG_PATH}", flush=True)
+        except Exception as exc:
+            print(f"LOG_SCHEMA_CHECK_FAILED path={LOG_PATH} err={exc}", flush=True)
     with LOG_PATH.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(SIGNAL_LOG_HEADER)
+
+
+CLV_REVIEW_HEADER = [
+    "ts", "slug", "side", "city", "station_code", "target_date", "entry_ts", "entry_price",
+    "model_prob_side", "last_bid", "last_spread", "last_bid_depth", "last_mark_value",
+    "last_clv", "last_return_pct", "clv_1h", "price_1h", "clv_3h", "price_3h",
+    "clv_final", "outcome", "brier", "status", "resolution_tier", "forecast_source",
+]
+
+
+SHADOW_TRADE_HEADER = [
+    "ts", "slug", "side", "city", "station_code", "target_date", "target_days",
+    "skip_reason", "price", "spread", "score", "model_prob_side", "edge", "ev",
+    "gross_ev", "order_size", "resolution_tier", "resolution_score",
+    "forecast_c", "threshold_c", "metar_c", "metar_station", "forecast_source",
+    "reason",
+]
+
+
+def ensure_shadow_trade_log() -> None:
+    SHADOW_TRADE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SHADOW_TRADE_PATH.exists():
+        return
+    with SHADOW_TRADE_PATH.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(SHADOW_TRADE_HEADER)
+
+
+def append_shadow_trade(row: dict[str, Any], skip_reason: str) -> None:
+    ensure_shadow_trade_log()
+    with SHADOW_TRADE_PATH.open("a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            "ts", "slug", "city", "station_code", "side", "action", "forecast_date", "target_date", "forecast_c", "threshold_c",
-            "comparator", "model_yes_raw", "model_yes", "model_prob_side", "market_price", "spread", "depth",
-            "volume", "edge", "gross_ev", "ev", "kelly_fraction", "size_multiplier", "order_size", "score",
-            "minimum_tick_size", "minimum_order_size", "accepting_orders", "reason", "question",
+            datetime.now(timezone.utc).isoformat(),
+            row.get("slug", ""),
+            row.get("side", ""),
+            row.get("city", ""),
+            row.get("station_code", ""),
+            row.get("target_date", ""),
+            row.get("target_days", ""),
+            skip_reason,
+            row.get("market_price", ""),
+            row.get("spread", ""),
+            row.get("score", ""),
+            row.get("model_prob_side", ""),
+            row.get("edge", ""),
+            row.get("ev", ""),
+            row.get("gross_ev", ""),
+            row.get("order_size", ""),
+            row.get("resolution_tier", ""),
+            row.get("resolution_score", ""),
+            row.get("forecast_c", ""),
+            row.get("threshold_c", ""),
+            row.get("metar_c", ""),
+            row.get("metar_station", ""),
+            row.get("forecast_source", ""),
+            row.get("reason", ""),
+        ])
+
+
+def ensure_clv_review_log() -> None:
+    CLV_REVIEW_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if CLV_REVIEW_PATH.exists():
+        return
+    with CLV_REVIEW_PATH.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(CLV_REVIEW_HEADER)
+
+
+def append_clv_review(row: dict[str, Any]) -> None:
+    ensure_clv_review_log()
+    with CLV_REVIEW_PATH.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            datetime.now(timezone.utc).isoformat(),
+            row.get("slug", ""),
+            row.get("side", ""),
+            row.get("city", ""),
+            row.get("station_code", ""),
+            row.get("target_date", ""),
+            row.get("entry_ts", ""),
+            row.get("entry_price") or row.get("price", ""),
+            row.get("model_prob_side", ""),
+            row.get("last_bid", ""),
+            row.get("last_spread", ""),
+            row.get("last_bid_depth", ""),
+            row.get("last_mark_value", ""),
+            row.get("last_clv", ""),
+            row.get("last_return_pct", ""),
+            row.get("clv_1h", ""),
+            row.get("price_1h", ""),
+            row.get("clv_3h", ""),
+            row.get("price_3h", ""),
+            row.get("clv_final", ""),
+            row.get("outcome", ""),
+            row.get("brier", ""),
+            row.get("status", ""),
+            row.get("resolution_tier", ""),
+            row.get("forecast_source", ""),
         ])
 
 
@@ -1378,8 +2387,18 @@ def mark_order_state(state: dict[str, Any], row: dict[str, Any], mode: str, stat
         "remaining_shares": str(shares),
         "mode": mode,
         "status": status,
+        "model_prob_side": str(row.get("model_prob_side", "")),
+        "entry_price": str(price),
+        "resolution_tier": row.get("resolution_tier", ""),
+        "resolution_score": str(row.get("resolution_score", "")),
+        "forecast_source": row.get("forecast_source", ""),
+        "entry_ts": datetime.now(timezone.utc).isoformat(),
         "snapshot_path": row.get("snapshot_path", ""),
         "take_profit_reduced": bool(row.get("take_profit_reduced", False)),
+        "yes_tp_3x_done": bool(row.get("yes_tp_3x_done", False)),
+        "yes_tp_5x_done": bool(row.get("yes_tp_5x_done", False)),
+        "yes_tp_10x_done": bool(row.get("yes_tp_10x_done", False)),
+        "yes_tp_full_done": bool(row.get("yes_tp_full_done", False)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     save_order_state(state)
@@ -1401,6 +2420,111 @@ def city_date_order_count(order_state: dict[str, Any], row: dict[str, Any]) -> i
         if item_key == key:
             count += 1
     return count
+
+
+def parse_iso_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def resolved_outcome_for_side(market: dict[str, Any], side: str) -> Optional[Decimal]:
+    # endDate only means the market window ended; require an explicit close flag/time
+    # plus terminal outcome prices before using this for Brier/CLV-final review.
+    if not (boolish_true(market.get("closed")) or boolish_true(market.get("archived")) or bool(market.get("closedTime"))):
+        return None
+    outcomes = [str(item).strip().lower() for item in parse_json_list(market.get("outcomes"))]
+    prices = parse_json_list(market.get("outcomePrices"))
+    if not outcomes or not prices or len(outcomes) != len(prices):
+        return None
+    parsed_prices = [dec(price) for price in prices]
+    if not any(price >= Decimal("0.99") for price in parsed_prices):
+        return None
+    if not any(price <= Decimal("0.01") for price in parsed_prices):
+        return None
+    target = side.strip().lower()
+    for outcome, price in zip(outcomes, parsed_prices):
+        if outcome in [target, target[0]]:
+            if price >= Decimal("0.99"):
+                return Decimal("1")
+            if price <= Decimal("0.01"):
+                return Decimal("0")
+    return None
+
+
+def exit_liquidity_check(book: BookSide, shares: Decimal, price: Decimal, cfg: Config) -> tuple[bool, str]:
+    if price <= 0:
+        return False, "invalid_exit_price"
+    if book.spread is None:
+        return False, "missing_exit_spread"
+    if book.spread > cfg.exit_max_spread:
+        return False, f"exit_spread {book.spread} > {cfg.exit_max_spread}"
+    required_depth = shares * cfg.exit_min_bid_depth_multiplier
+    if book.bid_depth_at_best < required_depth:
+        return False, f"exit_bid_depth {book.bid_depth_at_best} < {required_depth}"
+    return True, "exit_liquidity_ok"
+
+
+def update_open_position_marks(order_state: dict[str, Any], markets: list[dict[str, Any]], cfg: Config) -> None:
+    if not order_state:
+        return
+    market_by_slug = {str(m.get("slug", "")): m for m in markets}
+    changed = False
+    checked = 0
+    for slug, row in order_state.items():
+        if row.get("status") not in ["SENT", "REDUCED_PARTIAL"]:
+            continue
+        market = market_by_slug.get(slug)
+        if not market:
+            continue
+        yes_token, no_token = pick_tokens(market)
+        side = str(row.get("side", "")).upper()
+        token_id = yes_token if side == "YES" else no_token
+        if not token_id:
+            continue
+        book = book_side(get_order_book(token_id), cfg.yes_max_price if side == "YES" else cfg.no_max_price)
+        bid = book.bid
+        if bid is None:
+            continue
+        entry_price = dec(row.get("entry_price") or row.get("price"))
+        remaining_shares = dec(row.get("remaining_shares"))
+        current_value = (remaining_shares * bid).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        row["last_bid"] = str(bid)
+        row["last_spread"] = str(book.spread if book.spread is not None else "")
+        row["last_bid_depth"] = str(book.bid_depth_at_best)
+        row["last_mark_value"] = str(current_value)
+        if entry_price > 0:
+            clv = (bid - entry_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            row["last_clv"] = str(clv)
+            row["last_return_pct"] = str(((bid - entry_price) / entry_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+            entry_ts = parse_iso_datetime(str(row.get("entry_ts", "")))
+            if entry_ts:
+                elapsed_hours = Decimal(str((datetime.now(timezone.utc) - entry_ts).total_seconds() / 3600))
+                if elapsed_hours >= Decimal("1") and not row.get("clv_1h"):
+                    row["clv_1h"] = str(clv)
+                    row["price_1h"] = str(bid)
+                if elapsed_hours >= Decimal("3") and not row.get("clv_3h"):
+                    row["clv_3h"] = str(clv)
+                    row["price_3h"] = str(bid)
+            outcome = resolved_outcome_for_side(market, side)
+            if outcome is not None:
+                model_prob = dec(row.get("model_prob_side"))
+                row["outcome"] = str(outcome)
+                row["clv_final"] = str((outcome - entry_price).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+                if model_prob > 0:
+                    row["brier"] = str(((model_prob - outcome) ** 2).quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
+                row["status"] = "RESOLVED"
+        row["last_mark_ts"] = datetime.now(timezone.utc).isoformat()
+        append_clv_review(row)
+        checked += 1
+        changed = True
+    if changed:
+        save_order_state(order_state)
+        print(f"MARKS_UPDATED open_positions={checked}", flush=True)
 
 
 def classify_poly_error(exc: Exception) -> str:
@@ -1430,6 +2554,33 @@ def prepare_live_order(row: dict[str, Any], cfg: Config, target_dollars: Optiona
     live_row = dict(row)
     if target_dollars is not None and target_dollars > 0:
         live_row["order_size"] = target_dollars.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if (
+        cfg.skip_sub_min_ultra_low_orders
+        and str(live_row.get("side", "")).upper() == "YES"
+        and str(live_row.get("comparator", "")).lower() == "exact"
+        and dec(live_row.get("market_price")) <= cfg.yes_ultra_low_max_price
+        and dec(live_row.get("order_size")) < cfg.live_min_order_size
+    ):
+        raise ValueError(
+            f"ultra-low sub-min order blocked slug={live_row['slug']} "
+            f"price={live_row.get('market_price')} order_size={live_row.get('order_size')} "
+            f"live_min_order_size={cfg.live_min_order_size}"
+        )
+    if (
+        cfg.skip_sub_min_orders
+        and dec(live_row.get("order_size")) < cfg.live_min_order_size
+        and (
+            dec(live_row.get("score")) < cfg.sub_min_order_min_score
+            or dec(live_row.get("market_price")) < cfg.sub_min_order_min_price
+            or dec(live_row.get("resolution_score")) < cfg.sub_min_order_min_resolution_score
+        )
+    ):
+        raise ValueError(
+            f"sub-min order blocked slug={live_row['slug']} "
+            f"price={live_row.get('market_price')} score={live_row.get('score')} "
+            f"resolution_score={live_row.get('resolution_score')} order_size={live_row.get('order_size')} "
+            f"live_min_order_size={cfg.live_min_order_size}"
+        )
     if live_row["order_size"] < cfg.live_min_order_size:
         live_row["order_size"] = cfg.live_min_order_size
         print(
@@ -1439,6 +2590,10 @@ def prepare_live_order(row: dict[str, Any], cfg: Config, target_dollars: Optiona
     tick_size = dec(live_row.get("minimum_tick_size")) or cfg.live_default_tick_size
     min_order_size = dec(live_row.get("minimum_order_size")) or cfg.live_default_min_shares
     price = align_price(live_row["market_price"], tick_size)
+    if price <= 0:
+        raise ValueError(
+            f"aligned price is zero slug={live_row['slug']} market_price={live_row['market_price']} tick_size={tick_size}"
+        )
     shares = (live_row["order_size"] / price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     min_live_shares = min_shares_for_notional(cfg.live_min_order_size, price)
     if shares < min_live_shares:
@@ -1468,7 +2623,12 @@ def log_signal(row: dict[str, Any]) -> None:
             str(row["spread"]), str(row["depth"]), str(row["volume"]), str(row["edge"]), str(row["gross_ev"]), str(row["ev"]),
             str(row["kelly_fraction"]), str(row["size_multiplier"]), str(row["order_size"]), str(row["score"]),
             str(row.get("minimum_tick_size", "")), str(row.get("minimum_order_size", "")),
-            str(row.get("accepting_orders", "")), row["reason"], row["question"],
+            str(row.get("accepting_orders", "")), str(row.get("target_days", "")), str(row.get("history_gap", "")),
+            str(row.get("resolution_tier", "")), str(row.get("resolution_score", "")), str(row.get("forecast_source", "")),
+            str(row.get("ensemble_prob_yes", "")), str(row.get("ensemble_members", "")), str(row.get("ensemble_hits", "")),
+            str(row.get("metar_c", "")), str(row.get("metar_station", "")), str(row.get("metar_time", "")),
+            str(row.get("calibration", "")), str(row.get("mispricing_ok", "")), str(row.get("mispricing_reason", "")),
+            str(row.get("model_prob_side", "")), str(row.get("market_price", "")), "", "", "", "", "", row["reason"], row["question"],
         ])
 
 
@@ -1530,10 +2690,44 @@ def normalize_tick_size_str(tick: Decimal) -> Optional[str]:
     return tick_str if tick_str in allowed else None
 
 
+def clob_api_creds_source(cfg: Config) -> str:
+    filled = [bool(cfg.clob_api_key), bool(cfg.clob_secret), bool(cfg.clob_pass_phrase)]
+    if all(filled):
+        return "manual"
+    if any(filled):
+        return "partial_manual_invalid"
+    return "auto_derive"
+
+
+def manual_clob_api_creds(cfg: Config):
+    source = clob_api_creds_source(cfg)
+    if source == "manual":
+        if ApiCreds is None:
+            raise RuntimeError("CLOB manual credentials configured but ApiCreds type is unavailable")
+        return ApiCreds(
+            api_key=cfg.clob_api_key,
+            api_secret=cfg.clob_secret,
+            api_passphrase=cfg.clob_pass_phrase,
+        )
+    if source == "partial_manual_invalid":
+        raise ValueError("CLOB_API_KEY, CLOB_SECRET, and CLOB_PASS_PHRASE must be filled together")
+    return None
+
+
 def build_clob_client(cfg: Config):
     if ClobClient is None:
         return None
+    manual_creds = manual_clob_api_creds(cfg)
     if USE_CLOB_V2:
+        if manual_creds is not None:
+            return ClobClient(
+                host=CLOB_URL,
+                chain_id=cfg.chain_id,
+                key=cfg.private_key,
+                creds=manual_creds,
+                signature_type=cfg.signature_type,
+                funder=cfg.funder or None,
+            )
         base_client = ClobClient(
             host=CLOB_URL,
             chain_id=cfg.chain_id,
@@ -1551,7 +2745,7 @@ def build_clob_client(cfg: Config):
             funder=cfg.funder or None,
         )
     client = ClobClient(CLOB_URL, key=cfg.private_key, chain_id=cfg.chain_id, signature_type=cfg.signature_type, funder=cfg.funder or None)
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client.set_api_creds(manual_creds or client.create_or_derive_api_creds())
     return client
 
 
@@ -1601,20 +2795,22 @@ def post_sell_order(client, token_id: str, price: Decimal, shares: Decimal, tick
 
 def describe_runtime_wallet(cfg: Config) -> str:
     funder = (cfg.funder or "").strip()
+    api_creds_source = clob_api_creds_source(cfg)
     if not cfg.auto_order:
-        return f"mode=DRY_RUN funder={funder or '<unset>'}"
+        return f"mode=DRY_RUN funder={funder or '<unset>'} clob_api_creds_source={api_creds_source}"
     if not cfg.private_key:
-        return f"mode=LIVE funder={funder or '<unset>'} private_key=<missing>"
+        return f"mode=LIVE funder={funder or '<unset>'} private_key=<missing> clob_api_creds_source={api_creds_source}"
     if Account is None:
-        return f"mode=LIVE funder={funder or '<unset>'} derived=<eth_account missing>"
+        return f"mode=LIVE funder={funder or '<unset>'} derived=<eth_account missing> clob_api_creds_source={api_creds_source}"
     try:
         derived = Account.from_key(cfg.private_key).address
     except Exception as exc:
-        return f"mode=LIVE funder={funder or '<unset>'} derived=<invalid private key: {exc}>"
+        return f"mode=LIVE funder={funder or '<unset>'} derived=<invalid private key: {exc}> clob_api_creds_source={api_creds_source}"
     matches = derived.lower() == funder.lower() if funder else False
     return (
         f"mode=LIVE funder={funder or '<unset>'} derived={derived} "
-        f"funder_matches_private_key={matches}"
+        f"funder_matches_private_key={matches} signature_type={cfg.signature_type} "
+        f"clob_api_creds_source={api_creds_source}"
     )
 
 
@@ -1644,11 +2840,23 @@ def maybe_order(row: dict[str, Any], cfg: Config, order_state: dict[str, Any]) -
     if ClobClient is None:
         print("AUTO_ORDER requested but Polymarket client missing: pip install py_clob_client_v2")
         return "AUTO_ORDER_MISSING_CLIENT", Decimal("0")
-    client = build_clob_client(cfg)
+    try:
+        client = build_clob_client(cfg)
+    except Exception as exc:
+        print(
+            f"AUTO_ORDER_CLIENT_INIT_FAILED clob_api_creds_source={clob_api_creds_source(cfg)} err={exc}",
+            flush=True,
+        )
+        return "AUTO_ORDER_CLIENT_INIT_FAILED", Decimal("0")
     if client is None:
         print("AUTO_ORDER requested but failed to initialize Polymarket client")
         return "AUTO_ORDER_CLIENT_INIT_FAILED", Decimal("0")
-    live_row, price, shares = prepare_live_order(row, cfg)
+    try:
+        live_row, price, shares = prepare_live_order(row, cfg)
+    except ValueError as exc:
+        print(f"ORDER_SKIP_INVALID_PRICE slug={row['slug']} err={exc}", flush=True)
+        append_shadow_trade(row, str(exc))
+        return "ORDER_SKIP_INVALID_PRICE", Decimal("0")
     tick_size = dec(live_row.get("minimum_tick_size")) or cfg.live_default_tick_size
     try:
         resp = post_buy_order(client, row["token_id"], price, shares, tick_size)
@@ -1659,7 +2867,14 @@ def maybe_order(row: dict[str, Any], cfg: Config, order_state: dict[str, Any]) -
             if balance_dollars is not None:
                 retry_budget = (balance_dollars * cfg.live_balance_retry_buffer).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
                 if retry_budget >= cfg.live_min_order_size and retry_budget < dec(live_row["order_size"]):
-                    retry_row, retry_price, retry_shares = prepare_live_order(row, cfg, retry_budget)
+                    try:
+                        retry_row, retry_price, retry_shares = prepare_live_order(row, cfg, retry_budget)
+                    except ValueError as retry_prepare_exc:
+                        print(
+                            f"ORDER_RETRY_SKIP_INVALID_PRICE slug={row['slug']} retry_budget=${retry_budget} err={retry_prepare_exc}",
+                            flush=True,
+                        )
+                        return "ORDER_SKIP_INVALID_PRICE", Decimal("0")
                     retry_tick_size = dec(retry_row.get("minimum_tick_size")) or cfg.live_default_tick_size
                     try:
                         retry_resp = post_buy_order(client, row["token_id"], retry_price, retry_shares, retry_tick_size)
@@ -1817,7 +3032,6 @@ def auto_close_positions_on_take_profit(
                 f"TAKE_PROFIT_CLOSE_SKIP slug={item['slug']} side={item['side']} reason=below_min_sell_size remaining_shares={remaining_shares} bid={item['bid']}",
                 flush=True,
             )
-            order_state[item["slug"]]["take_profit_closed"] = True
             order_state[item["slug"]]["updated_at"] = datetime.now(timezone.utc).isoformat()
             save_order_state(order_state)
             continue
@@ -1827,6 +3041,19 @@ def auto_close_positions_on_take_profit(
         sell_price = align_price(item["bid"], item["minimum_tick_size"])
         if sell_price <= 0:
             print(f"TAKE_PROFIT_CLOSE_SKIP slug={item['slug']} side={item['side']} reason=invalid_bid", flush=True)
+            continue
+        exit_ok, exit_reason = exit_liquidity_check(
+            book_side(get_order_book(item["token_id"]), cfg.max_price),
+            sell_shares,
+            sell_price,
+            cfg,
+        )
+        if not exit_ok:
+            print(
+                f"TAKE_PROFIT_CLOSE_SKIP slug={item['slug']} side={item['side']} reason={exit_reason} "
+                f"shares={sell_shares} price={sell_price}",
+                flush=True,
+            )
             continue
 
         sell_notional = (sell_shares * sell_price).quantize(Decimal("0.01"), rounding=ROUND_UP)
@@ -1854,11 +3081,404 @@ def auto_close_positions_on_take_profit(
         )
 
 
+def yes_position_take_profit(order_state: dict[str, Any], markets: list[dict[str, Any]], cfg: Config) -> None:
+    if not cfg.yes_position_take_profit_enabled:
+        return
+    if not cfg.auto_order:
+        return
+    if not cfg.private_key or ClobClient is None:
+        print("YES_TP_SKIP missing_client_or_key", flush=True)
+        return
+
+    market_by_slug = {str(m.get("slug", "")): m for m in markets}
+    today_iso = datetime.now().date().isoformat()
+    client = None
+
+    for slug, row in list(order_state.items()):
+        if row.get("status") not in ["SENT", "REDUCED_PARTIAL"]:
+            continue
+        if str(row.get("side", "")).upper() != "YES":
+            continue
+        if cfg.yes_tp_same_day_only and row.get("target_date") != today_iso:
+            continue
+        if row.get("yes_tp_full_done"):
+            continue
+        market = market_by_slug.get(slug)
+        if not market:
+            continue
+        yes_token, _ = pick_tokens(market)
+        if not yes_token:
+            continue
+        book = book_side(get_order_book(yes_token), cfg.yes_max_price)
+        bid = book.bid
+        if bid is None or bid <= 0:
+            continue
+        entry_price = dec(row.get("price"))
+        remaining_shares = dec(row.get("remaining_shares"))
+        if remaining_shares <= 0:
+            order_size = dec(row.get("order_size"))
+            if entry_price > 0 and order_size > 0:
+                remaining_shares = (order_size / entry_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if entry_price <= 0 or remaining_shares <= 0:
+            continue
+
+        multiple = bid / entry_price
+        stage = ""
+        trigger_multiple = Decimal("0")
+        sell_fraction = Decimal("0")
+        if cfg.yes_tp_spike_mode_enabled and (bid >= cfg.yes_tp_spike_full_price or multiple >= cfg.yes_tp_spike_full_multiple):
+            stage = "spike_full"
+            trigger_multiple = cfg.yes_tp_spike_full_multiple
+            sell_fraction = Decimal("1")
+        elif cfg.yes_tp_spike_mode_enabled and (bid >= cfg.yes_tp_spike_price or multiple >= cfg.yes_tp_spike_multiple) and not row.get("yes_tp_spike_done"):
+            stage = "spike"
+            trigger_multiple = cfg.yes_tp_spike_multiple
+            sell_fraction = cfg.yes_tp_spike_fraction
+        elif bid >= cfg.yes_tp_full_exit_price:
+            stage = "full_80c"
+            trigger_multiple = cfg.yes_tp_full_exit_price
+            sell_fraction = Decimal("1")
+        elif multiple >= cfg.yes_tp_10x_multiple and not row.get("yes_tp_10x_done"):
+            stage = "10x"
+            trigger_multiple = cfg.yes_tp_10x_multiple
+            sell_fraction = cfg.yes_tp_10x_fraction
+        elif multiple >= cfg.yes_tp_5x_multiple and not row.get("yes_tp_5x_done"):
+            stage = "5x"
+            trigger_multiple = cfg.yes_tp_5x_multiple
+            sell_fraction = cfg.yes_tp_5x_fraction
+        elif multiple >= cfg.yes_tp_3x_multiple and not row.get("yes_tp_3x_done"):
+            stage = "3x"
+            trigger_multiple = cfg.yes_tp_3x_multiple
+            sell_fraction = cfg.yes_tp_3x_fraction
+        if not stage:
+            continue
+
+        sell_fraction = clamp(sell_fraction, Decimal("0"), Decimal("1"))
+        sell_shares = (remaining_shares * sell_fraction).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        minimum_tick_size = market_tick_size(market, cfg)
+        minimum_order_size = market_min_order_size(market, cfg)
+        min_market_shares = min_shares_for_floor(max(minimum_order_size, cfg.live_default_min_shares))
+        sell_price = align_price(bid, minimum_tick_size)
+        sell_notional = (sell_shares * sell_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if sell_shares < min_market_shares or sell_notional < cfg.live_min_order_size:
+            row["updated_at"] = datetime.now(timezone.utc).isoformat()
+            save_order_state(order_state)
+            print(
+                f"YES_TP_SKIP slug={slug} stage={stage} reason=below_min_sell_size "
+                f"trigger={trigger_multiple} remaining={remaining_shares} bid={bid} "
+                f"sell_shares={sell_shares} notional=${sell_notional}",
+                flush=True,
+            )
+            continue
+        if sell_price <= 0:
+            continue
+        exit_ok, exit_reason = exit_liquidity_check(book, sell_shares, sell_price, cfg)
+        if not exit_ok:
+            print(
+                f"YES_TP_SKIP slug={slug} stage={stage} reason={exit_reason} "
+                f"shares={sell_shares} price={sell_price}",
+                flush=True,
+            )
+            continue
+        if client is None:
+            client = build_clob_client(cfg)
+            if client is None:
+                print("YES_TP_SKIP client_init_failed", flush=True)
+                return
+        try:
+            resp = post_sell_order(client, yes_token, sell_price, sell_shares, minimum_tick_size)
+        except Exception as exc:
+            print(
+                f"YES_TP_FAILED slug={slug} stage={stage} trigger={trigger_multiple} multiple={multiple:.2f} "
+                f"shares={sell_shares} price={sell_price} err={exc}",
+                flush=True,
+            )
+            continue
+
+        new_remaining = max(Decimal("0"), remaining_shares - sell_shares)
+        row["remaining_shares"] = str(new_remaining.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        if stage in ["full_80c", "spike_full"] or new_remaining <= Decimal("0"):
+            row["yes_tp_full_done"] = True
+            row["take_profit_closed"] = True
+            row["status"] = "YES_TP_CLOSED"
+        elif stage == "spike":
+            row["yes_tp_spike_done"] = True
+            row["status"] = "REDUCED_PARTIAL"
+        elif stage == "10x":
+            row["yes_tp_10x_done"] = True
+            row["status"] = "REDUCED_PARTIAL"
+        elif stage == "5x":
+            row["yes_tp_5x_done"] = True
+            row["status"] = "REDUCED_PARTIAL"
+        elif stage == "3x":
+            row["yes_tp_3x_done"] = True
+            row["status"] = "REDUCED_PARTIAL"
+        row["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_order_state(order_state)
+
+        print(
+            f"YES_TP_EXECUTED slug={slug} stage={stage} trigger={trigger_multiple} multiple={multiple:.2f} "
+            f"sell_shares={sell_shares} remaining_shares={row['remaining_shares']} "
+            f"price={sell_price} notional=${sell_notional} resp={resp}",
+            flush=True,
+        )
+
+
+def hours_until_target_end(target_date: str) -> Optional[Decimal]:
+    try:
+        target = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except Exception:
+        return None
+    target_end = datetime(target.year, target.month, target.day, tzinfo=timezone.utc) + timedelta(days=1)
+    seconds = (target_end - datetime.now(timezone.utc)).total_seconds()
+    return Decimal(str(seconds / 3600))
+
+
+def yes_time_decay_stop_loss(order_state: dict[str, Any], markets: list[dict[str, Any]], cfg: Config) -> None:
+    if not cfg.yes_time_decay_stop_loss_enabled:
+        return
+    if not cfg.auto_order:
+        return
+    if not cfg.private_key or ClobClient is None:
+        print("YES_STOP_SKIP missing_client_or_key", flush=True)
+        return
+
+    market_by_slug = {str(m.get("slug", "")): m for m in markets}
+    client = None
+    for slug, row in list(order_state.items()):
+        if row.get("status") not in ["SENT", "REDUCED_PARTIAL"]:
+            continue
+        if str(row.get("side", "")).upper() != "YES":
+            continue
+        if row.get("yes_stop_loss_done"):
+            continue
+        hours_left = hours_until_target_end(str(row.get("target_date", "")))
+        if hours_left is None or hours_left > cfg.yes_time_decay_stop_loss_hours:
+            continue
+        market = market_by_slug.get(slug)
+        if not market:
+            continue
+        yes_token, _ = pick_tokens(market)
+        if not yes_token:
+            continue
+        book = book_side(get_order_book(yes_token), cfg.yes_max_price)
+        bid = book.bid
+        if bid is None or bid < cfg.yes_time_decay_stop_loss_min_bid:
+            continue
+        entry_price = dec(row.get("price"))
+        remaining_shares = dec(row.get("remaining_shares"))
+        if remaining_shares <= 0:
+            order_size = dec(row.get("order_size"))
+            if entry_price > 0 and order_size > 0:
+                remaining_shares = (order_size / entry_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if entry_price <= 0 or remaining_shares <= 0:
+            continue
+        loss_pct = (entry_price - bid) / entry_price
+        if loss_pct < cfg.yes_time_decay_stop_loss_pct:
+            continue
+        minimum_tick_size = market_tick_size(market, cfg)
+        sell_price = align_price(bid, minimum_tick_size)
+        if sell_price <= 0:
+            continue
+        exit_ok, exit_reason = exit_liquidity_check(book, remaining_shares, sell_price, cfg)
+        if not exit_ok:
+            print(
+                f"YES_STOP_SKIP slug={slug} reason={exit_reason} hours_left={hours_left:.2f} "
+                f"loss={loss_pct:.2%} shares={remaining_shares} price={sell_price}",
+                flush=True,
+            )
+            continue
+        min_market_shares = min_shares_for_floor(max(market_min_order_size(market, cfg), cfg.live_default_min_shares))
+        sell_notional = (remaining_shares * sell_price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if remaining_shares < min_market_shares or sell_notional < cfg.live_min_order_size:
+            print(
+                f"YES_STOP_SKIP slug={slug} reason=below_min_sell_size hours_left={hours_left:.2f} "
+                f"loss={loss_pct:.2%} remaining={remaining_shares} bid={bid}",
+                flush=True,
+            )
+            continue
+        if client is None:
+            client = build_clob_client(cfg)
+            if client is None:
+                print("YES_STOP_SKIP client_init_failed", flush=True)
+                return
+        try:
+            resp = post_sell_order(client, yes_token, sell_price, remaining_shares, minimum_tick_size)
+        except Exception as exc:
+            print(
+                f"YES_STOP_FAILED slug={slug} hours_left={hours_left:.2f} loss={loss_pct:.2%} "
+                f"shares={remaining_shares} price={sell_price} err={exc}",
+                flush=True,
+            )
+            continue
+        row["remaining_shares"] = "0"
+        row["yes_stop_loss_done"] = True
+        row["take_profit_closed"] = True
+        row["status"] = "YES_STOP_CLOSED"
+        row["updated_at"] = datetime.now(timezone.utc).isoformat()
+        save_order_state(order_state)
+        print(
+            f"YES_STOP_EXECUTED slug={slug} hours_left={hours_left:.2f} loss={loss_pct:.2%} "
+            f"shares={remaining_shares} price={sell_price} notional=${sell_notional} resp={resp}",
+            flush=True,
+        )
+
+
+
+def adjacent_sweep_hard_block(row: dict[str, Any], cfg: Config) -> bool:
+    reason = str(row.get("reason", ""))
+    hard_patterns = [
+        "market not accepting orders",
+        "YES city blacklisted",
+        "YES price",
+        "price ",
+        "days_ahead",
+        "target_date",
+        "volume",
+        "depth",
+        "kelly size is zero",
+    ]
+    if any(pattern in reason for pattern in hard_patterns):
+        return True
+    if cfg.yes_adjacent_block_soft_failures:
+        soft_patterns = [
+            "confidence ",
+            "forecast_distance ",
+            "history_prob ",
+            "history_mean_distance ",
+            "history_gap ",
+            "spread None",
+            "spread ",
+            "no-station",
+            "resolution source missing",
+            "late-entry",
+            "intraday required",
+            "missing METAR",
+        ]
+        if any(pattern in reason for pattern in soft_patterns):
+            return True
+    if cfg.yes_adjacent_require_station and not str(row.get("station_code", "")).strip():
+        return True
+    if dec(row.get("model_prob_side")) < cfg.yes_adjacent_min_model_prob:
+        return True
+    return False
+
+
+def promote_adjacent_yes_baskets(rows: list[dict[str, Any]], cfg: Config) -> int:
+    """Promote cheap adjacent exact YES baskets from MONITOR to BUY."""
+    if not cfg.yes_adjacent_sweep_enabled:
+        return 0
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("side") != "YES" or row.get("comparator") != "exact":
+            continue
+        price = dec(row.get("market_price"))
+        if price < cfg.yes_adjacent_min_price or price > cfg.yes_adjacent_max_price:
+            continue
+        if int(row.get("target_days", 999)) > cfg.yes_adjacent_max_days_ahead:
+            continue
+        if adjacent_sweep_hard_block(row, cfg):
+            continue
+        groups.setdefault(city_date_key(row), []).append(row)
+
+    promoted = 0
+    for _key, group in groups.items():
+        group.sort(key=lambda r: dec(r.get("threshold_c")))
+        clusters: list[list[dict[str, Any]]] = []
+        cluster: list[dict[str, Any]] = []
+        prev_threshold: Optional[Decimal] = None
+        for row in group:
+            threshold = dec(row.get("threshold_c"))
+            if not cluster or (prev_threshold is not None and abs(threshold - prev_threshold) <= cfg.yes_adjacent_max_step_c):
+                cluster.append(row)
+            else:
+                clusters.append(cluster)
+                cluster = [row]
+            prev_threshold = threshold
+        if cluster:
+            clusters.append(cluster)
+
+        for cluster in clusters:
+            if len(cluster) < cfg.yes_adjacent_min_count:
+                continue
+            cluster.sort(
+                key=lambda r: (
+                    dec(r.get("score")),
+                    dec(r.get("edge")),
+                    Decimal("1") - dec(r.get("market_price")),
+                ),
+                reverse=True,
+            )
+            limit = cfg.max_orders_per_city_date if cfg.max_orders_per_city_date > 0 else len(cluster)
+            for row in cluster[:limit]:
+                if row.get("action") == "BUY":
+                    continue
+                row["action"] = "BUY"
+                row["reason"] = f"ADJACENT_YES_SWEEP promoted; original_reason={row.get('reason', '')}"
+                promoted += 1
+    return promoted
+
+
+def build_signals_for_markets(markets: list[dict[str, Any]], cfg: Config) -> list[dict[str, Any]]:
+    global STATION_MAE_REFRESH_COUNT
+    total = len(markets)
+    if total == 0:
+        return []
+    with STATION_MAE_LOCK:
+        STATION_MAE_REFRESH_COUNT = 0
+        STATION_MAE_REFRESHING.clear()
+    workers = max(1, min(cfg.scan_workers, total))
+    progress_interval = max(1, cfg.scan_progress_interval)
+    if workers <= 1:
+        rows: list[dict[str, Any]] = []
+        for idx, market in enumerate(markets, start=1):
+            if VERBOSE or idx == 1 or idx % progress_interval == 0 or idx == total:
+                print(f"scan_progress mode=serial processed={idx}/{total} signals={len(rows)}", flush=True)
+            try:
+                row = build_signal(market, cfg)
+                if row:
+                    rows.append(row)
+            except Exception as exc:
+                if VERBOSE:
+                    print(f"market skipped slug={market.get('slug')} error={exc}", flush=True)
+        return rows
+
+    rows: list[dict[str, Any]] = []
+    processed = 0
+    started = time.monotonic()
+    print(f"scan_parallel_start markets={total} workers={workers}", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_market = {executor.submit(build_signal, market, cfg): market for market in markets}
+        for future in as_completed(future_to_market):
+            processed += 1
+            market = future_to_market[future]
+            try:
+                row = future.result()
+                if row:
+                    rows.append(row)
+            except Exception as exc:
+                if VERBOSE:
+                    print(f"market skipped slug={market.get('slug')} error={exc}", flush=True)
+            if processed == 1 or processed % progress_interval == 0 or processed == total:
+                elapsed = max(time.monotonic() - started, 0.001)
+                rate = processed / elapsed
+                remaining = (total - processed) / rate if rate > 0 else 0
+                print(
+                    f"scan_progress mode=parallel processed={processed}/{total} signals={len(rows)} "
+                    f"elapsed={elapsed:.1f}s eta={remaining:.1f}s",
+                    flush=True,
+                )
+    return rows
+
+
 def scan_once(cfg: Config) -> None:
     ensure_log()
     order_state = load_order_state()
     markets = fetch_temperature_markets(cfg)
     print(f"found_temperature_markets={len(markets)}", flush=True)
+    update_open_position_marks(order_state, markets, cfg)
+    yes_position_take_profit(order_state, markets, cfg)
+    yes_time_decay_stop_loss(order_state, markets, cfg)
     if cfg.auto_order and cfg.stop_new_orders_on_take_profit:
         today_cost, today_profit = estimate_today_open_profit(order_state, markets, cfg)
         take_profit_dollars = (cfg.bankroll * cfg.daily_take_profit_pct).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
@@ -1874,19 +3494,28 @@ def scan_once(cfg: Config) -> None:
             if cfg.take_profit_close_all_enabled:
                 auto_close_positions_on_take_profit(order_state, markets, cfg)
             return
-    rows = []
-    total = len(markets)
-    for idx, market in enumerate(markets, start=1):
-        if VERBOSE:
-            print(f"processing_market={idx}/{total} slug={market.get('slug')}", flush=True)
-        try:
-            row = build_signal(market, cfg)
-            if row:
-                rows.append(row)
-        except Exception as exc:
-            if VERBOSE:
-                print(f"market skipped slug={market.get('slug')} error={exc}", flush=True)
-    rows.sort(key=lambda r: r["score"], reverse=True)
+    rows = build_signals_for_markets(markets, cfg)
+    promoted_count = promote_adjacent_yes_baskets(rows, cfg)
+    if promoted_count:
+        print(f"ADJACENT_YES_SWEEP promoted={promoted_count}", flush=True)
+
+    def scan_priority(row: dict[str, Any]) -> tuple[int, int, int, Decimal]:
+        is_buy = row.get("action") == "BUY"
+        is_yes = row.get("side") == "YES"
+        is_exact = row.get("comparator") == "exact"
+        price = dec(row.get("market_price"))
+        in_sweet_spot = cfg.yes_sweet_spot_min_price <= price <= cfg.yes_sweet_spot_max_price
+        is_ultra_low = is_yes and is_exact and cfg.yes_ultra_low_min_price <= price <= cfg.yes_ultra_low_max_price
+        is_low_yes = is_yes and price <= cfg.yes_early_max_price
+        # Huskyvs-style mode: low-price exact YES baskets should be considered before NO.
+        return (
+            1 if is_buy else 0,
+            1 if (is_yes and is_exact and (is_ultra_low or in_sweet_spot or is_low_yes)) else 0,
+            1 if is_ultra_low else 0,
+            dec(row.get("score")),
+        )
+
+    rows.sort(key=scan_priority, reverse=True)
     buy_count = sum(1 for r in rows if r["action"] == "BUY")
     orders_sent_this_scan = 0
     dollars_sent_this_scan = Decimal("0")
@@ -1947,6 +3576,7 @@ def main() -> None:
     print(describe_runtime_wallet(cfg))
     print(
         f"auto_order={cfg.auto_order} run_once={cfg.run_once} only_today={cfg.only_today} band=+/-{cfg.temp_band_c}C "
+        f"scan_workers={cfg.scan_workers} scan_progress_interval={cfg.scan_progress_interval} "
         f"allow_side={cfg.allow_side} min_price={cfg.min_price} max_price={cfg.max_price} "
         f"yes_max_price={cfg.yes_max_price} no_max_price={cfg.no_max_price} "
         f"history_enabled={cfg.history_enabled} history_weight={cfg.history_weight} "
@@ -1955,14 +3585,37 @@ def main() -> None:
         f"strong_signal_ev={cfg.strong_signal_ev} max_signal_multiplier={cfg.max_signal_multiplier} "
         f"live_min_order_size={cfg.live_min_order_size} daily_take_profit_pct={cfg.daily_take_profit_pct} "
         f"take_profit_close_all={cfg.take_profit_close_all_enabled} clob_sdk={'v2' if USE_CLOB_V2 else 'v1'} "
+        f"yes_position_tp={cfg.yes_position_take_profit_enabled} "
+        f"yes_tp={cfg.yes_tp_3x_multiple}x/{cfg.yes_tp_3x_fraction},"
+        f"{cfg.yes_tp_5x_multiple}x/{cfg.yes_tp_5x_fraction},"
+        f"{cfg.yes_tp_10x_multiple}x/{cfg.yes_tp_10x_fraction},full@{cfg.yes_tp_full_exit_price} "
+        f"yes_tp_spike={cfg.yes_tp_spike_mode_enabled}@{cfg.yes_tp_spike_price}/{cfg.yes_tp_spike_multiple}x "
+        f"yes_time_decay_stop={cfg.yes_time_decay_stop_loss_enabled}/{cfg.yes_time_decay_stop_loss_hours}h/{cfg.yes_time_decay_stop_loss_pct} "
         f"yes_early_max_price={cfg.yes_early_max_price} yes_early_size_multiplier={cfg.yes_early_size_multiplier} "
+        f"yes_exact_only={cfg.yes_exact_only_mode} "
+        f"yes_ultra_low={cfg.yes_ultra_low_min_price}-{cfg.yes_ultra_low_max_price}x{cfg.yes_ultra_low_size_multiplier} "
+        f"skip_sub_min_ultra_low={cfg.skip_sub_min_ultra_low_orders} "
+        f"skip_sub_min={cfg.skip_sub_min_orders}/{cfg.sub_min_order_min_score}/"
+        f"{cfg.sub_min_order_min_price}/{cfg.sub_min_order_min_resolution_score} "
+        f"yes_adjacent_sweep={cfg.yes_adjacent_sweep_enabled}/{cfg.yes_adjacent_min_price}-{cfg.yes_adjacent_max_price}/"
+        f"{cfg.yes_adjacent_min_count}@{cfg.yes_adjacent_max_step_c}C "
+        f"yes_mispricing={cfg.yes_mispricing_accelerator_enabled}@{cfg.yes_mispricing_max_price}/{cfg.yes_mispricing_near_distance}C "
+        f"yes_sweet_spot={cfg.yes_sweet_spot_min_price}-{cfg.yes_sweet_spot_max_price}x{cfg.yes_sweet_spot_multiplier} "
         f"yes_intraday_enabled={cfg.yes_intraday_enabled} "
         f"yes_intraday_confirm_above_price={cfg.yes_intraday_confirm_above_price} "
         f"yes_intraday_confirm_distance={cfg.yes_intraday_confirm_distance} "
+        f"yes_low_price_current_metar={cfg.yes_low_price_require_current_metar_confirm}/"
+        f"{cfg.yes_low_price_current_metar_max_distance} "
+        f"skip_past_target_dates={cfg.skip_past_target_dates} "
+        f"forecast_probability_model={cfg.forecast_probability_model} forecast_mae_c={cfg.forecast_mae_c} "
+        f"ensemble_models={cfg.ensemble_models} ensemble_weight={cfg.ensemble_weight} "
         f"NO(edge/ev/score)={cfg.no_min_edge}/{cfg.no_min_ev}/{cfg.no_min_score} "
         f"no_max_days_ahead={cfg.no_max_days_ahead} no_size_multiplier={cfg.no_size_multiplier} "
         f"no_exact_min_forecast_distance={cfg.no_exact_min_forecast_distance} "
         f"no_exact_min_history_no_prob={cfg.no_exact_min_history_no_prob} "
+        f"no_station_enabled={cfg.no_station_enabled} "
+        f"no_station(edge/ev/score)={cfg.no_station_min_edge}/{cfg.no_station_min_ev}/{cfg.no_station_min_score} "
+        f"yes_no_station_max_price={cfg.yes_no_station_max_price} "
         f"YES(edge/ev/score)={cfg.yes_min_edge}/{cfg.yes_min_ev}/{cfg.yes_min_score}"
     )
     while True:
@@ -1974,3 +3627,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

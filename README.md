@@ -140,14 +140,14 @@ YES 主要走低价高赔率路线。
 
 ```env
 POLY_YES_EARLY_MAX_PRICE=0.08
-POLY_YES_EARLY_SIZE_MULTIPLIER=0.45
+POLY_YES_EARLY_SIZE_MULTIPLIER=0.60
 POLY_YES_MAX_PRICE=0.18
 ```
 
 含义：
 
 - YES 价格小于等于 `0.08` 时，允许提前埋伏。
-- 提前埋伏会自动小仓，仓位乘数为 `0.45`。
+- 提前埋伏会自动小仓，仓位乘数为 `0.60`。这个档位是当前历史复盘里 ROI 最高的结构。
 - YES 最高买入价格为 `0.18`。
 
 ## YES 盘中确认
@@ -171,26 +171,83 @@ POLY_METAR_ENABLED=true
 NO 主要走确认型逻辑。
 
 ```env
-POLY_NO_MAX_PRICE=0.20
-POLY_NO_MIN_EDGE=0.16
-POLY_NO_MIN_EV=0.25
-POLY_NO_MIN_SCORE=0.18
-POLY_NO_MAX_DAYS_AHEAD=0
-POLY_NO_SIZE_MULTIPLIER=0.55
-POLY_NO_EXACT_MIN_FORECAST_DISTANCE=1.20
-POLY_NO_EXACT_MIN_HISTORY_NO_PROB=0.82
-POLY_NO_METAR_BLOCK_DISTANCE=1.00
-POLY_NO_METAR_RISK_DISTANCE=1.50
+POLY_NO_MAX_PRICE=0.35
+POLY_NO_MIN_EDGE=0.12
+POLY_NO_MIN_EV=0.18
+POLY_NO_MIN_SCORE=0.12
+POLY_NO_MAX_DAYS_AHEAD=1
+POLY_NO_SIZE_MULTIPLIER=0.45
+POLY_NO_EXACT_MIN_FORECAST_DISTANCE=1.00
+POLY_NO_EXACT_MIN_HISTORY_NO_PROB=0.76
+POLY_NO_METAR_BLOCK_DISTANCE=0.80
+POLY_NO_METAR_RISK_DISTANCE=1.20
+POLY_NO_TIERED_SIZING_ENABLED=true
 ```
 
 含义：
 
-- NO 最高买入价格收紧到 `0.20`，避免中高价 NO 错一次亏太多。
-- NO 默认只做当天市场，`POLY_NO_MAX_DAYS_AHEAD=0`。
-- NO 仓位乘数为 `0.55`，即使信号很强也会比普通信号更小仓。
-- exact 类型 NO 要求预报温度距离阈值至少 `1.20°C`，避免贴边误判。
-- exact 类型 NO 要求过去 5 年同期历史上“不等于该阈值”的概率至少 `82%`。
+- NO 最高买入价格放宽到 `0.35`，参考 4 月 28/29 日盈利时的中低价 NO 区间。
+- NO 允许当天和隔天市场，`POLY_NO_MAX_DAYS_AHEAD=1`。
+- 普通 NO 基础仓位乘数为 `0.45`，先用小仓控制风险。
+- exact 类型 NO 要求预报温度距离阈值至少 `1.00°C`，避免极度贴边误判。
+- exact 类型 NO 要求过去 5 年同期历史上“不等于该阈值”的概率至少 `76%`。
 - 如果 METAR 实况温度已经距离阈值过近，NO 会被过滤，避免盘中临近击穿还继续买 NO。
+
+### NO 分档加仓
+
+NO 不再简单固定小仓，而是根据确定性分档：
+
+```env
+POLY_NO_SIZE_MULTIPLIER=0.45
+POLY_NO_TIER_MID_PROB=0.76
+POLY_NO_TIER_MID_EDGE=0.24
+POLY_NO_TIER_MID_EV=0.35
+POLY_NO_TIER_MID_MULTIPLIER=0.75
+POLY_NO_TIER_HIGH_PROB=0.82
+POLY_NO_TIER_HIGH_EDGE=0.32
+POLY_NO_TIER_HIGH_EV=0.60
+POLY_NO_TIER_HIGH_MULTIPLIER=1.10
+POLY_NO_TIER_ELITE_PROB=0.88
+POLY_NO_TIER_ELITE_EDGE=0.42
+POLY_NO_TIER_ELITE_EV=0.90
+POLY_NO_TIER_ELITE_MULTIPLIER=1.45
+POLY_NO_TIER_MIN_FORECAST_DISTANCE=1.40
+POLY_NO_TIER_MIN_HISTORY_NO_PROB=0.82
+```
+
+含义：
+
+- 普通 NO 默认 `0.45` 倍仓位。
+- 中等确定性 NO 提到 `0.75` 倍。
+- 高确定性 NO 提到 `1.10` 倍。
+- 极高确定性 NO 提到 `1.45` 倍。
+- exact 类型 NO 想进入加仓档，预报距离阈值至少 `1.40°C`，历史 NO 概率至少 `82%`。
+
+### 无站点城市风控
+
+如果 Polymarket 的市场规则里没有明确给出 `KSFO / ZSPD / RKSI` 这类结算站点，脚本会把它视为无站点市场。最近复盘显示，无站点城市是亏损的主要来源，所以这类市场会被降级处理。
+
+```env
+POLY_NO_STATION_ENABLED=false
+POLY_NO_STATION_MIN_EDGE=0.30
+POLY_NO_STATION_MIN_EV=0.60
+POLY_NO_STATION_MIN_SCORE=0.20
+POLY_NO_STATION_MIN_FORECAST_DISTANCE=1.80
+POLY_NO_STATION_MIN_HISTORY_NO_PROB=0.84
+POLY_NO_STATION_SIZE_MULTIPLIER=0.35
+
+POLY_YES_NO_STATION_MAX_PRICE=0.08
+POLY_YES_NO_STATION_MIN_HISTORY_PROB=0.24
+POLY_YES_NO_STATION_MAX_FORECAST_DISTANCE=0.70
+POLY_YES_NO_STATION_SIZE_MULTIPLIER=0.50
+```
+
+含义：
+
+- `POLY_NO_STATION_ENABLED=false`：没有明确结算站点的 NO 默认不下单。
+- 如果你改成 `true`，无站点 NO 也必须满足更高的 edge、EV、score、历史 NO 概率和预报距离。
+- 无站点 YES 只保留低价埋伏，价格必须不高于 `0.08`，并且仓位再乘以 `0.50`。
+- 这个模块不影响有明确站点的城市，有站点市场仍按原来的 METAR、历史、ensemble 和分档仓位逻辑执行。
 
 ## 历史温度
 
@@ -198,9 +255,14 @@ POLY_NO_METAR_RISK_DISTANCE=1.50
 POLY_HISTORY_ENABLED=true
 POLY_HISTORY_LOOKBACK_YEARS=5
 POLY_HISTORY_WINDOW_DAYS=15
+POLY_ENSEMBLE_ENABLED=true
+POLY_ENSEMBLE_MIN_MEMBERS=8
+POLY_ENSEMBLE_WEIGHT=0.75
 ```
 
 脚本会参考过去多年同日期附近的温度数据，用来判断当前阈值是否有历史支持。
+
+同时脚本会优先尝试 Open-Meteo GFS ensemble。若能拿到足够成员，就按“满足阈值的成员数 / 总成员数”估算概率，再和原单点预报概率混合。这个思路参考了公开天气交易 bot 常用的 ensemble 投票方法，目标是减少单点预报过度自信。
 
 ## 结算站点对齐
 
@@ -367,3 +429,24 @@ csv/
 本项目仅用于研究和学习量化策略、预测市场定价与自动化交易流程。
 
 任何实盘交易风险由使用者自行承担。
+## YES position take profit
+
+Low-price YES trades are option-like: many small losses, a few large repricings. The bot now checks existing YES positions at the start of every scan and tries to lock profit in stages.
+
+```env
+POLY_YES_POSITION_TAKE_PROFIT_ENABLED=true
+POLY_YES_TP_3X_MULTIPLE=3.0
+POLY_YES_TP_5X_MULTIPLE=5.0
+POLY_YES_TP_10X_MULTIPLE=10.0
+POLY_YES_TP_3X_FRACTION=0.35
+POLY_YES_TP_5X_FRACTION=0.35
+POLY_YES_TP_10X_FRACTION=0.50
+POLY_YES_TP_FULL_EXIT_PRICE=0.80
+POLY_YES_TP_SAME_DAY_ONLY=false
+```
+
+- At 3x, sell 35% of remaining YES shares.
+- At 5x, sell another 35% of remaining YES shares.
+- At 10x, sell 50% of remaining YES shares.
+- At 80c or higher, try to close the full remaining YES position.
+- If the sell size is below Polymarket minimums, the bot skips that stage and waits for a better exit.
